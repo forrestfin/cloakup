@@ -1,0 +1,125 @@
+id: books_bbb919992c63
+name: 图书分类采集 · 实测流程
+description: ''
+version: 1
+start_url: https://books.toscrape.com/
+allowed_domains:
+- books.toscrape.com
+goal: On books.toscrape.com open the {{category}} category, open the first {{max_items}}
+  book(s) one by one, and record each book's title, price and in-stock quantity.
+inputs:
+  type: object
+  required:
+  - category
+  - max_items
+  properties:
+    category:
+      type: string
+      description: Book category to open from the sidebar, e.g. Poetry.
+    max_items:
+      type: integer
+      description: Number of books from the top of the category list to inspect.
+      default: 1
+      minimum: 1
+outputs:
+  type: object
+  required:
+  - books
+  properties:
+    books:
+      type: array
+      items:
+        type: object
+        required:
+        - title
+        - price
+        - in_stock
+        properties:
+          title:
+            type: string
+          price:
+            type: string
+          in_stock:
+            type:
+            - integer
+            - 'null'
+steps:
+- id: open_category
+  action: click
+  intent: Open the {{category}} category page from the sidebar categories.
+  target:
+    tag: a
+    label: '{{category}}'
+    href_contains: /category/books/
+  expect:
+    url_contains: /catalogue/category/books/
+    text_contains: '{{category}}'
+- id: collect_book_links
+  action: extract
+  intent: Collect the product detail links from the category listing in display order.
+  instruction: From the product grid, return the ordered book links currently shown
+    (href and title). Do not open them yet.
+  schema:
+    type: object
+    required:
+    - book_links
+    properties:
+      book_links:
+        type: array
+        items:
+          type: object
+          required:
+          - href
+          - title
+          properties:
+            href:
+              type: string
+            title:
+              type: string
+  save_as: listing
+- id: open_books_and_extract
+  action: foreach
+  intent: Open each of the first {{max_items}} books from the category listing and
+    capture its details.
+  items: '{{vars.listing.book_links}}'
+  limit: '{{max_items}}'
+  as: book
+  steps:
+  - id: open_book_detail
+    action: click
+    intent: Open this book's detail page from the listing.
+    target:
+      tag: a
+      label: '{{book.title}}'
+      href_contains: '{{book.href}}'
+    expect:
+      url_contains: /catalogue/
+  - id: extract_book
+    action: extract
+    intent: Read the book title, price and number in stock from the product detail
+      page.
+    instruction: Extract the product title, the displayed price including its currency
+      symbol, and the integer availability count from stock text such as 'In stock
+      (22 available)'. Use null if the stock count is not shown.
+    schema:
+      type: object
+      required:
+      - title
+      - price
+      - in_stock
+      properties:
+        title:
+          type: string
+        price:
+          type: string
+        in_stock:
+          type:
+          - integer
+          - 'null'
+    append_to: books
+  - id: return_to_category
+    action: go_back
+    intent: Return to the {{category}} listing to process the next book.
+    expect:
+      url_contains: /catalogue/category/books/
+      text_contains: '{{category}}'

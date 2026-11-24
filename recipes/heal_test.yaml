@@ -1,0 +1,88 @@
+id: heal_test
+name: Books to Scrape 分类前 N 本书信息提取
+description: 打开 books.toscrape.com 首页，点击左侧分类链接进入分类页，提取前 N 本书的书名与价格。
+version: 2
+start_url: https://books.toscrape.com/
+allowed_domains:
+- books.toscrape.com
+goal: 在 books.toscrape.com 首页打开左侧分类 {{category}} 的页面，记录该分类下前 {{n}} 本书的书名和价格。
+inputs:
+  type: object
+  properties:
+    category:
+      type: string
+      description: 要打开的分类名称，需与首页左侧分类栏中的链接文字一致，例如 Travel
+    n:
+      type: integer
+      description: 要记录的商品数量（前 n 本书）
+      default: 2
+      minimum: 1
+  required:
+  - category
+  - n
+  additionalProperties: false
+outputs:
+  type: object
+  properties:
+    category:
+      type: string
+      description: 实际打开的分类名称
+    books:
+      type: array
+      description: 前 N 本书的书名与价格
+      items:
+        type: object
+        properties:
+          title:
+            type: string
+            description: 书名
+          price:
+            type: string
+            description: 价格，含货币符号
+        required:
+        - title
+        - price
+        additionalProperties: false
+  required:
+  - category
+  - books
+  additionalProperties: false
+steps:
+- id: open_category
+  action: click
+  intent: 在首页左侧分类侧边栏点击 {{category}} 分类链接，进入该分类的商品列表页
+  target:
+    tag: a
+    label: '{{category}}'
+  expect:
+    url_contains: /catalogue/category/books/
+    text_contains: '{{category}}'
+- id: extract_books
+  action: extract
+  intent: 从分类列表页提取前 {{n}} 本书的书名与价格
+  instruction: '当前是分类 {{category}} 的商品列表页。按从上到下的顺序遍历商品条目（每个条目是一个 article.product_pod，书名在其中的 h3 > a 的 title 属性或文字中，价格在
+    .price_color 中）。只取前 {{n}} 个条目，返回对象 {"category": "{{category}}", "books": [{"title": ..., "price": ...}]}。书名取完整标题文字（若显示被截断，取
+    title 属性/完整链接文本），价格保留货币符号。'
+  schema:
+    type: object
+    properties:
+      category:
+        type: string
+      books:
+        type: array
+        items:
+          type: object
+          properties:
+            title:
+              type: string
+            price:
+              type: string
+          required:
+          - title
+          - price
+          additionalProperties: false
+    required:
+    - category
+    - books
+    additionalProperties: false
+  merge: true

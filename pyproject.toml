@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloakup"
+version = "0.1.0"
+description = "AI-driven, human-paced browser agent built on CloakBrowser + Claude"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "cloakbrowser[geoip]>=0.7.2,<0.8",
+    "anthropic>=1.0",
+    "deepseek-harness-sdk==0.2.2rc2",
+    "pyyaml>=6.0",
+    "jsonschema>=4.18",
+    "sqlalchemy>=2.0,<2.1",
+    "psycopg[binary]>=3.2,<4",
+    "pypdf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+cloakup = "cloakup.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cloakup"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py310"
+# 现有代码大量使用紧凑单行写法，暂不启用行宽与格式检查，只拦截真实缺陷。
+line-length = 400
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+# B904: 对外的中文错误提示有意替换原异常；B905: 有 zip(xs, xs[1:]) 这类长度不等的用法。
+ignore = ["B904", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试中导入的 fixture 在 ruff 看来是未使用的导入，自动删除会破坏测试。
+"tests/*" = ["F401", "F811", "F841", "B017"]

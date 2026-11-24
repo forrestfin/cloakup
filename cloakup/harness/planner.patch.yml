@@ -1,0 +1,15 @@
+# Official sdk-minimal profile with no model-facing execution or file tools.
+- id: tool-fs
+  disabled: true
+- id: tool-working-directory
+  disabled: true
+- id: persistent-bash
+  disabled: true
+- id: persistent-pwsh
+  disabled: true
+- id: session-log-deepseek
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  disabled: true
+- id: deepseek-llm-api-extensions
+  disabled: true

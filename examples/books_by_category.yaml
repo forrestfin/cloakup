@@ -1,0 +1,71 @@
+# 示例流程:在练习站点 books.toscrape.com 按分类取前 N 本书的书名、价格、库存。
+# 试跑:  cloakup recipe run examples/books_by_category.yaml --params '{"category": "Poetry", "max_items": 2}'
+id: books_by_category
+name: 按分类抓取图书
+description: 打开指定分类,逐本打开前 N 本书,记录书名、价格和库存
+version: 1
+start_url: https://books.toscrape.com/
+allowed_domains: [books.toscrape.com]
+goal: 在 books.toscrape.com 打开分类 {{category}},记录前 {{max_items}} 本书的书名、价格和库存
+inputs:
+  type: object
+  properties:
+    category: {type: string, description: 图书分类名称(英文,如 Poetry、Travel、Mystery)}
+    max_items: {type: integer, minimum: 1, maximum: 20, default: 3, description: 抓取的书本数量}
+  required: [category]
+outputs:
+  type: object
+  required: [books]
+  properties:
+    books:
+      type: array
+      items:
+        type: object
+        required: [title, price]
+        properties:
+          title: {type: string}
+          price: {type: string}
+          in_stock: {type: [integer, "null"]}
+steps:
+  - id: open_category
+    action: click
+    intent: 在左侧分类导航里点击分类 {{category}}
+    target: {tag: a, label: "{{category}}"}
+    expect: {url_contains: /category/}
+  - id: list_titles
+    action: extract
+    intent: 提取当前分类页上的书名列表(按页面顺序)
+    instruction: 按页面顺序列出本页所有图书的完整书名(书名取链接的 title 或链接文字)
+    schema:
+      type: object
+      required: [titles]
+      properties:
+        titles: {type: array, items: {type: string}}
+    save_as: listing
+  - id: each_book
+    action: foreach
+    intent: 逐本打开前 {{max_items}} 本书
+    items: "{{vars.listing.titles}}"
+    limit: "{{max_items}}"
+    as: title
+    steps:
+      - id: open_book
+        action: click
+        intent: 打开书《{{title}}》的详情页
+        target: {tag: a, label: "{{title}}"}
+        expect: {text_contains: Product Description}
+      - id: book_detail
+        action: extract
+        intent: 提取书名、价格和库存数量
+        schema:
+          type: object
+          required: [title, price, in_stock]
+          properties:
+            title: {type: string}
+            price: {type: string, description: 含货币符号,如 £51.77}
+            in_stock: {type: [integer, "null"], description: 库存数量,如 "In stock (22 available)" -> 22}
+        append_to: books
+      - id: back_to_list
+        action: go_back
+        intent: 返回分类列表页
+        expect: {url_contains: /category/}

@@ -1,0 +1,60 @@
+name: cloakup
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cloakup
+      POSTGRES_DB: cloakup
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U cloakup -d cloakup']
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  app:
+    build: .
+    restart: unless-stopped
+    hostname: cloakup-browser
+    stop_grace_period: 30s
+    init: false
+    shm_size: 1gb
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CLOAKUP_BIND_HOST: 0.0.0.0
+      CLOAKUP_PUBLIC_PORT: '${CLOAKUP_PUBLIC_PORT:-8766}'
+      ANTHROPIC_BASE_URL: '${ANTHROPIC_BASE_URL:-}'
+      ANTHROPIC_AUTH_TOKEN: '${ANTHROPIC_AUTH_TOKEN:-}'
+      ANTHROPIC_API_KEY: '${ANTHROPIC_API_KEY:-}'
+      CLOAKUP_MODEL: '${CLOAKUP_MODEL:-claude-opus-5-5}'
+      CLOAKUP_API_COMPAT: '${CLOAKUP_API_COMPAT:-auto}'
+      CLOAKBROWSER_LICENSE_KEY: '${CLOAKBROWSER_LICENSE_KEY:-}'
+      LARK_APP_ID: '${LARK_APP_ID:-}'
+      LARK_APP_SECRET: '${LARK_APP_SECRET:-}'
+    secrets: [postgres_password]
+    ports:
+      - '127.0.0.1:${CLOAKUP_PUBLIC_PORT:-8766}:8765'
+      - '127.0.0.1:${CLOAKUP_BROWSER_PORT:-6080}:6080'
+    volumes:
+      - workspace-data:/data
+      # 日志与日报直接落到本机 data/ 下，便于在本机查看和持续分析（data/ 不入库）。
+      - ./data/logs:/data/logs
+      - ./data/reports:/data/reports
+      - browser-cache:/home/cloakup/.cloakbrowser
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health',timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+secrets:
+  postgres_password:
+    file: ./data/docker/postgres-password
+volumes:
+  postgres-data:
+  workspace-data:
+  browser-cache:

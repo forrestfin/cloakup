@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!requirements.lock
+!pyproject.toml
+!README.md
+!cloakup/
+!cloakup/**
+!docker/
+!docker/**
+**/__pycache__/
