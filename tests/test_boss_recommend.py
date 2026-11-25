@@ -207,3 +207,95 @@ async def test_profile_without_one_greet_button_sets_aside_only_this_candidate(m
         await br._profile_button(NS(),'g-1')
     assert isinstance(caught.value,SourcingError)
     assert logged and logged[0]['type']=='profile_button_missing' and logged[0]['buttons']==[label for label,_ in buttons]
+
+
+# 11-25 13:31 只读诊断：推荐页岗位下拉为 .job-selecter-wrap 内 li.job-item，value=encryptJobId；frame URL 的 jobid 同一个 id。
+class SwitchSession:
+    def __init__(self,current='job-AAAAAA',reloads_to=None,option_count=1,cards_after=None):
+        self.page=NS(frames=[NS(url='https://www.zhipin.com/web/frame/recommend/?jobid='+current+'&status=0')])
+        self.clicks=[];self.reloads_to=reloads_to;self.option_count=option_count
+        self.cards=['g-old'];self.cards_after=['g-new'] if cards_after is None else cards_after
+
+
+@pytest.fixture
+def switch_world(monkeypatch):
+    async def frame_click(session,frame,css):
+        session.clicks.append(css)
+        if 'li.job-item' in css and session.reloads_to:
+            session.page.frames=[NS(url='https://www.zhipin.com/web/frame/recommend/?jobid='+session.reloads_to+'&status=0')];session.cards=session.cards_after
+    async def value(session,fragment,expr):
+        if expr==br.CARD_IDS:return session.cards
+        assert 'querySelectorAll' in expr and 'job-BBBBBB' in expr
+        return session.option_count
+    async def no_sleep(_):return None
+    monkeypatch.setattr(br,'_frame_click',frame_click);monkeypatch.setattr(br,'_frame_value',value);monkeypatch.setattr(br.asyncio,'sleep',no_sleep)
+
+
+async def test_switch_skipped_when_already_on_job(switch_world):
+    s=SwitchSession(current='job-BBBBBB')
+    assert await br.switch_job(s,'job-BBBBBB','岗位乙') is False and s.clicks==[]
+
+
+async def test_switch_opens_dropdown_and_picks_option_by_job_id(switch_world):
+    s=SwitchSession(reloads_to='job-BBBBBB')
+    assert await br.switch_job(s,'job-BBBBBB','岗位乙') is True
+    assert s.clicks==[br.SWITCH_LABEL,'.job-selecter-wrap li.job-item[value="job-BBBBBB"]']
+
+
+@pytest.mark.parametrize('kw',[{'reloads_to':'job-AAAAAA'},{'reloads_to':None},{'reloads_to':'job-BBBBBB','cards_after':['g-old']},{'reloads_to':'job-BBBBBB','option_count':0},{'reloads_to':'job-BBBBBB','option_count':2}])
+async def test_switch_failure_defers_only_that_job(switch_world,kw):
+    s=SwitchSession(**kw)
+    with pytest.raises(SourcingError,match='推荐页面未能切换到当前岗位') as caught:await br.switch_job(s,'job-BBBBBB','岗位乙')
+    # 不含页面级关键词，autopilot 只暂缓这个岗位的首聊，任务不暂停
+    assert not any(t in str(caught.value) for t in ('登录','校验','验证','过于频繁','账号存在异常'))
+    if kw.get('option_count') in (0,2):assert s.clicks==[br.SWITCH_LABEL]
+
+
+async def test_switch_rejects_unexpected_job_id_without_clicking(switch_world):
+    s=SwitchSession()
+    with pytest.raises(SourcingError,match='推荐页面未能切换到当前岗位'):await br.switch_job(s,'x"]),li[value','岗位乙')
+    assert s.clicks==[]
+
+
+async def test_switch_click_problem_becomes_job_deferral(switch_world,monkeypatch):
+    async def blocked(session,frame,css):raise SourcingError('内嵌控件被遮挡或不在可见区域；未点击')
+    monkeypatch.setattr(br,'_frame_click',blocked)
+    with pytest.raises(SourcingError,match='推荐页面未能切换到当前岗位（内嵌控件被遮挡'):await br.switch_job(SwitchSession(),'job-BBBBBB','岗位乙')
+
+
+async def test_open_list_switches_to_target_job(monkeypatch):
+    from cloakup import page_health
+    order=[]
+    async def heal(session,kind):return {'healthy':True}
+    async def navigate(url):order.append('navigate')
+    async def click(session,label,**kw):order.append('tab:'+label)
+    async def switch(session,job_id,title):order.append(('switch',job_id,title))
+    async def verify(session,job_id,title):order.append(('verify',job_id))
+    async def cards(session):return []
+    monkeypatch.setattr(page_health,'heal',heal);monkeypatch.setattr(br,'_click',click);monkeypatch.setattr(br,'switch_job',switch)
+    monkeypatch.setattr(br,'verify_list',verify);monkeypatch.setattr(br,'read_cards',cards)
+    session=NS(max_elements=0,navigate=navigate,page=None)
+    case={'job':{'label':'岗位乙','url':'https://www.zhipin.com/job_detail/x.html?encryptId=job-BBBBBB'},'recommend_filters':[]}
+    monkeypatch.setattr(br,'job_identity',lambda c:'job-BBBBBB')
+    await br.open_list(session,case)
+    assert order[:4]==['navigate','tab:推荐',('switch','job-BBBBBB','岗位乙'),('verify','job-BBBBBB')]
+
+
+async def test_switch_waits_for_card_list_to_change_after_url(switch_world):
+    # URL 先变成目标岗位、卡片还是旧岗位的：不能放行
+    with pytest.raises(SourcingError,match='推荐列表未刷新'):await br.switch_job(SwitchSession(reloads_to='job-BBBBBB',cards_after=['g-old']),'job-BBBBBB','岗位乙')
+    assert await br.switch_job(SwitchSession(reloads_to='job-BBBBBB',cards_after=[]),'job-BBBBBB','岗位乙') is True
+
+
+@pytest.mark.parametrize('exc',[RuntimeError('frame_changed'),TimeoutError()])
+async def test_switch_frame_reload_errors_defer_only_that_job(switch_world,monkeypatch,exc):
+    async def broken(session,frame,css):raise exc
+    monkeypatch.setattr(br,'_frame_click',broken)
+    with pytest.raises(SourcingError,match='推荐页面未能切换到当前岗位') as caught:await br.switch_job(SwitchSession(),'job-BBBBBB','岗位乙')
+    assert not any(t in str(caught.value) for t in ('登录','校验','验证','过于频繁','账号存在异常'))
+
+
+async def test_switch_without_recommend_frame_defers(switch_world):
+    s=SwitchSession();s.page.frames=[]
+    with pytest.raises(SourcingError,match='推荐页面尚未加载'):await br.switch_job(s,'job-BBBBBB','岗位乙')
+    assert s.clicks==[]

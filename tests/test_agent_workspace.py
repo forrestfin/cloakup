@@ -389,3 +389,13 @@ def test_cached_validation_sees_new_and_changed_tests(setup,monkeypatch):
     assert validated_cases(lab.db,t['id'])=={c['id']}
     edit_release(lab,t,lambda b:b['sources'][0]['facts'].append({'kind':'duties','value':'新职责','status':'confirmed'}))
     assert validated_cases(lab.db,t['id'])==set()
+
+
+@pytest.mark.parametrize('value,question',[('工作地点：武汉东西湖区','那您前面说的工作地点是在哪里？'),
+                                           ('远程协作，地区不限，华中区域优先。','那您前面说的工作安排是怎样的？')])
+def test_known_fact_question_matches_a_place_fact(monkeypatch,value,question):
+    # 11-25 17:25 FDE交付工程师加入验收 8/9：唯一的工作安排类事实是“工作地点：…”，固定问“工作安排”，模型合理地澄清而判不通过。
+    import cloakup.agent_workspace as aw
+    monkeypatch.setattr(aw,'case_for',lambda bundle,cid:{'confirmed_facts':[{'kind':'work_arrangement','value':value,'status':'confirmed'}]})
+    known=[f for f in default_fixtures({'sources':[{'case_id':'c1'}]}) if f['id']=='c1:known_fact']
+    assert [m['text'] for m in known[0]['messages']]==[value,question] and known[0]['expected_routes']==['answer']

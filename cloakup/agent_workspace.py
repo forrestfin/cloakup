@@ -224,7 +224,8 @@ def default_fixtures(bundle):
         facts=case_for(bundle,cid)['confirmed_facts']
         fact=next((f for f in facts if f.get('status')=='confirmed' and f['kind'] in ('work_arrangement','duties')),None)
         if fact:
-            question='请介绍一下岗位工作内容？' if fact['kind']=='duties' else '那您前面说的工作安排是怎样的？'
+            # 11-25 FDE交付工程师：事实只讲地点时问“工作安排”，模型合理澄清却判失败；按事实所讲的主题追问（通用词，不含岗位词）。
+            question='请介绍一下岗位工作内容？' if fact['kind']=='duties' else '那您前面说的工作地点是在哪里？' if re.search(r'工作地点|办公地点|办公地址|工作地址',fact['value']) else '那您前面说的工作安排是怎样的？'
             cases.append({'id':cid+':known_fact','case_id':cid,'messages':[{'direction':'out','text':fact['value']},{'direction':'in','text':question}],
                           'expected_routes':['answer'],'mandatory':True,'has_resume':False,'pending_resume':False})
         # An existing CV must never be requested again, even after an invitation.

@@ -52,6 +52,8 @@ def _check_addable(manager,task_id,members,cid):
     if cid in [m['case_id'] for m in members]:raise ValueError('岗位已在任务中')
     if len(members)>=20:raise ValueError('一个任务最多20个岗位')
     if not case['job'].get('snapshot') or case.get('job_sourcing') is None or not case.get('config_revision',0)>0:raise ValueError(UNCONFIGURED)
+    # 11-25 17:05：脱敏岗位事实为空时，原先在验收前的整单校验深处报 jsonschema 错，管理员只看到“操作失败”。
+    if not (case.get('anonymous_job') or {}).get('requirements'):raise ValueError('请先打开该岗位的“沟通配置”，核对系统根据 JD 生成的脱敏岗位事实（可增删改）并保存，再加入任务')
     if not case.get('autonomy',{}).get('enabled'):raise ValueError('请先为该岗位启用自动化')
     others=[m for m in manager.account_execution.members() if m['id']!=task_id and m['status']!='stopped']
     if any(cid in m['case_ids'] for m in others):raise ValueError('岗位已由其他任务管理，请先停止原任务')

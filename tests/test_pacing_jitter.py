@@ -14,15 +14,10 @@ def test_stable_fraction_is_repeatable_per_key_and_differs_across_keys():
     assert all(0 <= stable_fraction('k', i) < 1 for i in range(50))
 
 
-def test_daily_new_target_stays_under_admin_cap_and_varies_by_job_and_day(monkeypatch):
-    # 管理员配置值是封顶；不同日期、不同岗位的实际上限在 75%～100% 间变化，同一天内保持不变。
-    targets = set()
+def test_daily_new_target_equals_admin_limit(monkeypatch):
+    # 11-25 管理员：每天要把首聊额度用完；当天目标等于配置上限，不再按 75%～100% 打折。
     for day in range(30):
         monkeypatch.setattr(ap, 'day_key', lambda now=None, d=day: '2026-11-%02d' % (d + 1))
         for job in ('a', 'b'):
-            case = {'id': job, 'autonomy': {'daily_new_limit': 20}}
-            value = ap.daily_new_target(case)
-            assert 15 <= value <= 20 and value == ap.daily_new_target(case)
-            targets.add(value)
-    assert len(targets) > 2
+            assert ap.daily_new_target({'id': job, 'autonomy': {'daily_new_limit': 20}}) == 20
     assert ap.daily_new_target({'id': 'x', 'autonomy': {'daily_new_limit': 0}}) == 0

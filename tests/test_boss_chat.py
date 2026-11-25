@@ -582,3 +582,21 @@ async def test_identity_refresh_keeps_scrolling_for_an_old_chat(monkeypatch):
  with pytest.raises(bc.ChatSelectionUnavailable) as caught:
   await bc._identity_from_platform_row(NS(),row,'12-0','甲','岗位')
  assert caught.value.diagnostics['reason']=='list_identity_mismatch'
+
+
+async def test_menu_is_scrolled_to_the_top_before_rows_are_read(monkeypatch):
+ # 11-25 17:39–18:00 FDE交付工程师加入后，多名候选人主动打招呼一直没被处理：上一岗位刚打开 11-22 的老会话，
+ # 虚拟列表停在下方，只渲染老会话行；顶部的新来信行不在 DOM 里，新岗位每轮读到的都是别的岗位的行。
+ state={'top':False};order=[]
+ async def observation(session):return NS(raw={'text':''})
+ async def evaluate(session,expr):
+  if expr==bc.ROWS_JS:
+   order.append('rows')
+   return [{'chat_id':'1-0','text':'新候选人 新岗位','unread':True}] if state['top'] else [{'chat_id':'9-0','text':'老候选人 老岗位','unread':False}]
+  if expr==bc.LIST_SCROLL_JS.replace('MODE','"top"'):
+   order.append('top');state['top']=True;return {'moved':True,'end':False,'via':'container'}
+  return None
+ async def no_sleep(*a):pass
+ monkeypatch.setattr(bc,'_observation',observation);monkeypatch.setattr(bc,'evaluate',evaluate);monkeypatch.setattr(bc.asyncio,'sleep',no_sleep)
+ rows=await bc.open_menu(NS(page=NS(url=bc.CHAT_URL)))
+ assert order[0]=='top' and [r['chat_id'] for r in rows]==['1-0']

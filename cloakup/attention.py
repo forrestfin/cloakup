@@ -139,6 +139,21 @@ class AttentionStore:
             if change['status']!='pending' or change['task_id'] not in running or time.time()-change['at']<JOB_CHANGE_STUCK_SECONDS:continue
             add('job_change_stuck:'+change['id'],'job_change_stuck','岗位变更等待超时','岗位变更等待执行器安全点超过 30 分钟：'+change_label(change)+'仍未生效。已做：变更保持排队，任务其他工作照常，没有向候选人发消息。需要：查看任务运行状态与执行器日志，确认执行器仍在推进；生效后此待办自动解除。',
                 task_id=change['task_id'],case_id=change.get('case_id'),job_label=case_labels.get(change.get('case_id'),''),job_change_id=change['id'])
+        # 浏览器代办（读取/绑定 BOSS 岗位）未完成：同类（绑定按岗位）有更新的请求（重试）后自动解除；管理员标记已处理（放弃）后保持关闭。
+        # 停在 running 但所属运行已不在进行中（服务重启、运行结束）也算未完成（下次结算标为失败，沿用同一待办）。
+        from .browser_errands import KIND as ERRAND_KIND,STEPS as ERRAND_STEPS,STUCK_SECONDS as ERRAND_STUCK,INTERRUPTED,RUN_ACTIVE,label as errand_label,scope as errand_scope,window_open_db
+        errands=self.db.list(ERRAND_KIND);live_runs={r.get('id') for r in runs if r.get('status') in RUN_ACTIVE}
+        for errand in errands:
+            orphan=errand['status']=='running' and errand.get('run_id') not in live_runs
+            if not (errand['status']=='failed' or orphan) or any(r['at']>errand['at'] and errand_scope(r)==errand_scope(errand) for r in errands):continue
+            add('browser_errand:'+errand['id'],'browser_errand','BOSS 岗位读取或绑定未完成',errand_label(errand)+'未完成，卡在“'+ERRAND_STEPS[errand['kind']]+'”：'+((INTERRUPTED if orphan else errand.get('error')) or '原因未记录')+'。已做：只标记这一条代办，任务其他工作照常，没有向候选人发消息。需要：查看原因后在岗位导入页重试，或把此待办标记为已处理（放弃）。',
+                errand_id=errand['id'],job_label=errand.get('title') or '')
+        # 代办在执行时段内排队超过 30 分钟仍未执行（执行器被接管、已停止等）：执行后自动解除；时段外排队是正常等待，不提醒。
+        if window_open_db(self.db):
+            for errand in errands:
+                if errand['status']!='pending' or time.time()-errand['at']<ERRAND_STUCK:continue
+                add('browser_errand_stuck:'+errand['id'],'browser_errand_stuck','BOSS 岗位读取或绑定等待超时',errand_label(errand)+'在执行时段内排队超过 30 分钟仍未执行。已做：代办保持排队，执行时段内执行器会在安全点处理；没有执行器时，再点一次刷新或绑定会带起执行。需要：确认执行器在运行、没有被管理员接管，或在岗位导入页再点一次刷新；执行后此待办自动解除。',
+                    errand_id=errand['id'],job_label=errand.get('title') or '')
         # 运行中且绑定当前生效版本的任务：验收已失效的岗位只停发送。版本不一致属于 release_changed，不在这里重复提醒。
         from . import agent_workspace
         for member in running.values():
@@ -320,7 +335,7 @@ class AttentionStore:
         todo=self.db.get('attention',ident)
         status=body.get('status');note=body.get('note','')
         if status not in ('pending','in_progress','resolved') or not isinstance(note,str) or len(note)>4000:raise ValueError('待办状态或处理说明不合法')
-        if status=='resolved' and todo['kind'] in ('login','verification','capacity','delivery','execution','execution_recovery','greeting','platform_action','decision','operator','planning','action','browser_health','job_change_stuck','job_not_validated','task_not_validated','job_outreach_blocked'):
+        if status=='resolved' and todo['kind'] in ('login','verification','capacity','delivery','execution','execution_recovery','greeting','platform_action','decision','operator','planning','action','browser_health','job_change_stuck','job_not_validated','task_not_validated','job_outreach_blocked','browser_errand_stuck'):
             raise ValueError('请先在关联任务或平台核实并处理；该类待办由真实状态自动解除')
         if status=='resolved' and not note.strip():raise ValueError('请填写处理结果，便于追溯')
         todo.update(status=status,updated_at=time.time(),note=note)

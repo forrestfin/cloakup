@@ -156,6 +156,13 @@ def test_add_requires_confirmed_job_configuration(setup):
     assert not s.m.db.list(jc.KIND)
 
 
+def test_add_without_anonymous_job_facts_says_what_to_fill(setup):
+    # 11-25 17:05 FDE交付工程师：绑定后保存了问候语、启用了自动化，但脱敏岗位事实为空；加入时在验收前深处报 jsonschema 错（500“操作失败”）。
+    s=setup;c=s.m.cases.load(s.b['id']);c['anonymous_job']=None;s.m.cases.save(c)
+    with pytest.raises(ValueError,match='脱敏岗位事实'):jc.request(s.m,s.task['id'],{'action':'add','case_id':c['id']})
+    assert not s.m.db.list(jc.KIND)
+
+
 def test_add_rejects_duplicate_title_across_account(setup):
     s=setup;c=_job(s.m.cases,'交付顾问','另一份要求。')
     with pytest.raises(ValueError,match='同名'):jc.request(s.m,s.task['id'],{'action':'add','case_id':c['id']})

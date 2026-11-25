@@ -631,11 +631,8 @@ async def sync_and_follow(manager,job,session,case):
 
 
 def daily_new_target(case):
-    """当天实际主动联系上限：管理员配置值是封顶，每天按“日期+岗位”稳定取其 75%～100%，
-    避免每天都恰好联系同样人数；同一天内多次计算结果一致。"""
-    limit=case['autonomy']['daily_new_limit']
-    if limit<=0:return 0
-    return max(1,round(limit*(0.75+0.25*stable_fraction('daily_new',day_key(),case['id']))))
+    """当天实际主动联系上限：等于管理员配置值（11-25 管理员：每天要把首聊额度用完，不再按 75%～100% 打折）。"""
+    return max(0,case['autonomy']['daily_new_limit'])
 
 
 # 每批评估人数上限的随机区间；每批单独抽取，避免固定次数的规律。
@@ -1031,6 +1028,7 @@ async def run_account_executor(manager,job,session):
     """Inbox first for each account job; outreach is a separate due queue."""
     from .boss_contact import ObservationUnavailable
     from .selection_recovery import failure as selection_failure, recovered as selection_recovered, unresolved, resume_verification, preserve_scene
+    from .browser_errands import at_safe_point as run_browser_errands
     due={};sync_due={};held={};read_failures={};cycle=0
     for cid,record in job.get('selection_recovery',{}).items():
         if record['status'] not in ('recovered','deferred'):
@@ -1064,6 +1062,8 @@ async def run_account_executor(manager,job,session):
                 job.update(autopilot_stage=idle_stage,active_case_id=None,next_check_at=None)
                 manager.event(job,'step','所有任务已暂停或结束，执行器待机；保留浏览器，不操作网站')
                 manager.persist(job)
+            # 管理员登记的浏览器代办（读取、绑定 BOSS 岗位）：执行时段内在此安全点做一条，做完回沟通页。
+            await run_browser_errands(manager,job,session)
             # 只有“系统因页面打不开而暂停”的任务会在执行时段内定时自愈，其他暂停不碰网站。
             await heal_paused_tasks_safely(manager,job,session)
             await asyncio.sleep(1)
@@ -1086,6 +1086,8 @@ async def run_account_executor(manager,job,session):
             continue
         cycle+=1;job['autopilot_cycle']=cycle
         job['case_results']=held.copy();job['inbound_resume_cases']=[]
+        # 安全点（未持有任何会话）：做一条浏览器代办（读取、绑定 BOSS 岗位），做完回沟通页再做页面检查；页面级问题照常停止。
+        await run_browser_errands(manager,job,session)
         # 每轮开始前对当前 BOSS 页做一次只读健康检查；卡在加载等情况先自愈，掉登录、验证交给后续读取按原流程处理。
         await check_page_health(session)
         # 安全点：其他任务在运行时，系统因页面打不开而暂停的任务同样按间隔自愈、恢复（规则与待机时相同）。

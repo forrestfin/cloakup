@@ -90,7 +90,7 @@ try:
   page.locator('#job-add-'+tid+' select[name=case_id]').select_option(F);page.locator('#job-add-'+tid+' input[name=weight]').fill('2')
   page.locator('#job-add-'+tid).get_by_role('button',name='验收并加入').click()
   assert last()==[('/api/tasks/'+tid+'/jobs',{'action':'add','case_id':F,'weight':2})]
-  expect(page.locator('#job-add-'+tid).get_by_role('button',name='粘贴链接导入新岗位')).to_be_visible()
+  expect(page.locator('#job-add-'+tid).get_by_role('button',name='从 BOSS 选择新岗位')).to_be_visible()
   # 重新验收：用当前生效版本建草案并跑完整隔离验收，不发布
   row(C).get_by_role('button',name='重新验收').click()
   assert last(2)==[('/api/tasks/'+tid+'/agent-workspace/draft',{}),('/api/tasks/'+tid+'/agent-workspace/test',{'draft_id':draft['id'],'mode':'validate'})],writes[-2:]

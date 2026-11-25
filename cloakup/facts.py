@@ -45,3 +45,39 @@ def effective_job(case):
   values += [v for v in job.get('requirements',[]) if not any(re.search(pattern,v) for pattern in ANCHORS.values())]
   job['requirements']=list(dict.fromkeys(values))
  return job
+
+# 11-25 FDE交付工程师：绑定后脱敏岗位事实为空，加入任务失败。由本地按 JD 与寻访计划拼一版草稿（不再调用模型），
+# 只填进表单供管理员核对；保存才算确认。只用通用句式与平台字段，不写死任何岗位或行业的词。
+MONEY=re.compile(r'\d+(?:\.\d+)?\s*(?:[kKwW千万元]|/月|/年)')
+PLACE=re.compile(r'[一-龥]{2,8}?(?:市|区|县)')
+EXPERIENCE_FIELD=re.compile(r'\d+\s*-\s*\d+\s*年|\d+\s*年以[上内]|经验不限|应届')
+EDUCATION_FIELD=re.compile(r'^(?:大专|本科|硕士|博士|学历不限)$')
+
+def draft_anonymous_job(case):
+ if case.get('anonymous_job'):return None
+ snapshot=(case.get('job') or {}).get('snapshot') or {};plan=case.get('search_plan') or {}
+ lines,dropped=[],0
+ place=PLACE.match(str(snapshot.get('location') or '').strip())
+ if place:lines.append('工作地点：'+place.group(0))
+ fields=[str(v).strip() for v in snapshot.get('platform_fields') or []]
+ lines+=['经验要求：'+v for v in fields if EXPERIENCE_FIELD.fullmatch(v)][:1]+['学历要求：'+v for v in fields if EDUCATION_FIELD.match(v)][:1]
+ for item in plan.get('requirements') or []:
+  text=str(item.get('requirement') or '').strip()
+  if not text or item.get('kind') not in ('required','preferred'):continue
+  lines.append(text if item['kind']=='required' else '加分项：'+text)
+ from .recruiting_ai import IDENTIFIER
+ kept=[]
+ for line in lines:
+  if IDENTIFIER.search(line) or MONEY.search(line) or len(line)>500:dropped+=1;continue
+  if line not in kept:kept.append(line)
+ if not kept:return None
+ label=str((case.get('job') or {}).get('label') or '').strip()
+ role=label if label and not IDENTIFIER.search(label) and len(label)<=40 else '当前岗位'
+ kept=kept[:30]
+ empty={k:'' for k in ('experience','availability','visible_evidence','coverage')}
+ while kept:
+  try:checked_brief({'job':{'role':role,'requirements':kept},'candidate':empty});break
+  except ValueError:kept.pop();dropped+=1
+ if not kept:return None
+ facts=[{'id':uuid.uuid4().hex,'kind':kind,'value':line,'status':'confirmed'} for line in kept for kind,pattern in ANCHORS.items() if re.search(pattern,line)]
+ return {'role':role,'requirements':kept,'facts':facts,'dropped':dropped}

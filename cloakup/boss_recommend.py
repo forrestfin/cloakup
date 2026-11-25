@@ -4,19 +4,24 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from urllib.parse import parse_qs, urlparse
 
 from .boss import validate_job_url
 from .boss_contact import BossFirstContact, GREETING_URL, GREETING_FRAME, _click, _main_button, _frame_value, _observation, valid_message
 from .logbook import log
-from .pacing import lognormal
+from .pacing import jitter, lognormal
 from .sourcing import SourcingError
 
 RECOMMEND_URL = 'https://www.zhipin.com/web/chat/recommend'
 RECOMMEND_FRAME = '/web/frame/recommend/'
 ALLOWED_FILTERS = {'本科', '硕士', '博士', '5-10年', '10年以上'}
 GREETING_TTL = 300
+# 11-25 只读诊断：岗位下拉在推荐页 frame 的 .job-selecter-wrap，选项 li.job-item 的 value 即 encryptJobId（docs/design/boss-job-pages.md）
+SWITCH_LABEL = '.job-selecter-wrap .ui-dropmenu-label'
+JOB_ID = re.compile(r'[A-Za-z0-9_~-]{6,80}')
+CARD_IDS = "Array.from(document.querySelectorAll('.candidate-card-wrap .card-inner[data-geekid]')).map(e=>e.getAttribute('data-geekid'))"
 
 class GreetingVerificationError(SourcingError):pass
 
@@ -51,6 +56,58 @@ async def verify_list(session, job_id, title):
     return frame.url
 
 
+async def _frame_click(session, frame, css):
+    from .frame_actions import click
+    await click(session, frame, css)
+
+
+def _recommend_job(session):
+    frame = next((f for f in session.page.frames if RECOMMEND_FRAME in f.url), None)
+    return frame, parse_qs(urlparse(frame.url).query).get('jobid', [None])[0] if frame else None
+
+
+async def switch_job(session, job_id, title):
+    """推荐页切到本岗位：已是本岗位不点；否则展开岗位下拉，按 value=encryptJobId 点唯一选项，等 frame 的 jobid 变成目标。
+
+    失败只抛开聊入口问题（不含登录/验证等页面级字样），上层只暂缓该岗位首聊，任务不暂停。"""
+    frame, current = _recommend_job(session)
+    if frame is not None and current == job_id:
+        return False
+    def failed(reason):
+        log('state', type='recommend_switch_failed', job_id=job_id, reason=reason)
+        return SourcingError('推荐页面未能切换到当前岗位（' + reason + '），已暂缓该岗位开聊')
+    if frame is None:raise failed('推荐页面尚未加载')
+    if not isinstance(job_id, str) or not JOB_ID.fullmatch(job_id):raise failed('岗位标识格式不符')
+    option = '.job-selecter-wrap li.job-item[value="' + job_id + '"]'
+    try:
+        # 切换前记下当前卡片：frame URL 可能先变、列表后刷新，不能拿旧岗位的推荐去联系
+        before = await _frame_value(session, RECOMMEND_FRAME, CARD_IDS)
+        await _frame_click(session, frame, SWITCH_LABEL)
+        await asyncio.sleep(jitter(1.0, .2))
+        count = await _frame_value(session, RECOMMEND_FRAME, 'document.querySelectorAll(' + json.dumps(option) + ').length')
+        if count != 1:raise failed('岗位下拉里没有该岗位' if not count else '岗位下拉选项不唯一')
+        frame, _ = _recommend_job(session)
+        if frame is None:raise failed('推荐页面在展开岗位下拉后消失')
+        await _frame_click(session, frame, option)
+    except SourcingError as exc:
+        if str(exc).startswith('推荐页面未能切换到当前岗位'):raise
+        raise failed(str(exc)[:60]) from exc
+    except (RuntimeError, TimeoutError) as exc:
+        # frame 重载中读取或点击（frame_changed 等）也只算这个岗位的开聊入口问题
+        raise failed(str(exc)[:60] or type(exc).__name__) from exc
+    # 等 frame 到目标岗位且卡片列表换过；总等待有上限（约 15 秒）
+    for _ in range(20):
+        await asyncio.sleep(jitter(.75, .2))
+        _, current = _recommend_job(session)
+        if current != job_id:continue
+        try:after = await _frame_value(session, RECOMMEND_FRAME, CARD_IDS)
+        except (SourcingError, RuntimeError, TimeoutError):continue
+        if not before or after != before:
+            log('action', type='recommend_job_switched', job_id=job_id, actor='executor')
+            return True
+    raise failed('切换后页面仍不是该岗位' if current != job_id else '切换后推荐列表未刷新')
+
+
 async def open_list(session, case):
     checked_filters(case.get('recommend_filters', []))
     # Larger local observations let semantic targets include the whole filter
@@ -74,6 +131,8 @@ async def open_list(session, case):
     if not state.get('healthy'):
         raise SourcingError('推荐牛人页多次刷新和重置后仍未正常加载（' + str(state.get('cause') or state.get('reason')) + '）')
     await _click(session, '推荐', tag='li', frame=RECOMMEND_FRAME)
+    # 多岗位任务：推荐页默认停在上次的岗位，先切到本岗位再核对（Task 8）
+    await switch_job(session, job_identity(case), case['job']['label'])
     await verify_list(session, job_identity(case), case['job']['label'])
     filters = case.get('recommend_filters', [])
     if filters:

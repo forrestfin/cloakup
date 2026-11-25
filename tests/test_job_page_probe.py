@@ -46,7 +46,9 @@ def fake_reads(monkeypatch):
         if expression.startswith('((document.body'):return 999
         if 'maxNodes' not in expression:raise AssertionError('unexpected main read')
         return {'html':'<div class="job-row" data-id="abc123DEF456ghi789~~">岗位甲</div><a href="/x?id=zz99887766aa">x</a>','nodes':3,'skipped':0,'truncated':False,'url':'/'}
+    calls['frame_text']=[300]
     async def read_frame(session,frame,expression):
+        if expression==probe.TEXT_LEN:calls['frame_text_reads']=calls.get('frame_text_reads',0)+1;return calls['frame_text'].pop(0) if len(calls['frame_text'])>1 else calls['frame_text'][0]
         if 'leaves' in expression:return calls['switch']
         if 'querySelector(css)' in expression:return calls['check']
         if 'out.length>=6000' in expression:return calls['visible'].pop(0) if calls['visible'] else []
@@ -191,3 +193,16 @@ def test_skeleton_expression_is_bounded():
 
 def test_ui_words_exclude_single_characters_that_double_as_names():
     assert not set(probe.UI_WORDS)&set('周万元天新月年中我个')
+
+
+# 11-25 13:31 实采：职位列表 frame /web/frame/job_v2/list 刚出现时只有空的 <div id="app">，没等渲染就读了
+async def test_job_list_waits_until_its_frame_has_content(fake_reads):
+    fake_reads['frame_text']=[0,0,0,300]
+    await probe.read_job_pages(manager(),'t')
+    assert fake_reads['frame_text_reads']>=4 and fake_reads['capture']['job_list']['settled'] is True
+
+
+async def test_job_list_never_rendering_is_recorded_not_fatal(fake_reads):
+    fake_reads['frame_text']=[0]
+    report=await probe.read_job_pages(manager(),'t')
+    assert fake_reads['capture']['job_list']['settled'] is False and report['completed']

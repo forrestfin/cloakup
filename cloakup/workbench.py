@@ -42,6 +42,7 @@ from .boss_contact import run_first_contact, valid_message
 from .boss_recommend import open_list as read_recommendations, run_recommend_review
 from .autopilot import run_autopilot
 from .job_config import view_config, save_config
+from .facts import draft_anonymous_job
 from .access import is_boss_url, boss_login_required, boss_verification_required, boss_access_ready, can_recover_login
 from .attention import AttentionStore, sourcing_overview
 from .storage import Database
@@ -52,7 +53,7 @@ BROWSER_LICENSE_RETRIES = 3
 
 ASSETS = Path(__file__).with_name("web")
 ACTIVE = {"queued", "running", "pausing", "paused", "waiting", "compiling", "cancelling", "closing"}
-BOSS_MODES = ("browser_open", "login", "boss_bind", "boss_contact", "boss_recommend", "boss_autopilot")
+BOSS_MODES = ("browser_open", "login", "boss_bind", "boss_contact", "boss_recommend", "boss_autopilot", "boss_errand")
 BOOK_SCHEMA = {"type": "object", "required": ["books"], "properties": {"books": {
     "type": "array", "items": {"type": "object", "required": ["title", "price", "in_stock"],
     "properties": {"title": {"type": "string"}, "price": {"type": "string"},
@@ -272,6 +273,12 @@ class Workbench:
             settle_job_changes(self)
         except Exception as exc:
             logging.getLogger("cloakup").warning("重启时结算岗位变更失败：%s",exc)
+        # 重启前停在 running 的浏览器代办：标为中断失败（生成待办、可重试），不一直显示“绑定中”。
+        try:
+            from .browser_errands import settle as settle_errands
+            settle_errands(self)
+        except Exception as exc:
+            logging.getLogger("cloakup").warning("重启时结算浏览器代办失败：%s",exc)
         from .scenario_workspace import ScenarioWorkspace
         self.scenario_workspace=ScenarioWorkspace(self)
         self.preflight_task = None
@@ -561,7 +568,7 @@ class Workbench:
             "ui_version": str((ASSETS / "app.js").stat().st_mtime_ns),
             "definitions": self.definitions.list(), "readiness": self.latest_readiness(), "executor_checks": executor_checks, "database": self.db.backend, "runtime": "docker" if Path("/.dockerenv").exists() else "local",
             "capabilities": {"boss_first_contact": True, "boss_recommend": True, "boss_autopilot": True},
-            "cases": [{**c,"editable_config":view_config(c)} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
+            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c)} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
             "busy": self.busy()["id"] if self.busy() else None})
 
     def job_overview(self,cases):
@@ -807,7 +814,7 @@ class Workbench:
                 return await self.start_account_task(definition['id'])
         if self.busy() and not body.get("allow_queue",False):
             raise ValueError("已有任务在运行，请先完成或停止该任务")
-        if body.get("mode") not in ("browser_open", "login", "boss_contact", "boss_recommend", "boss_autopilot") and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+        if body.get("mode") not in ("browser_open", "login", "boss_contact", "boss_recommend", "boss_autopilot", "boss_errand") and not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
             raise ValueError("尚未配置模型凭据，请在启动终端设置 ANTHROPIC_API_KEY 或 ANTHROPIC_AUTH_TOKEN 后重启工作台")
         mode = body.get("mode", "explore")
         if mode not in ("explore", "replay", "automation_task", *BOSS_MODES):
@@ -879,6 +886,10 @@ class Workbench:
         elif mode == "boss_bind":
             params = {"job_url": validate_job_url(params.get("job_url", ""))}
             task = "读取已建 BOSS 岗位并生成寻访计划与开聊草稿"
+        elif mode == "boss_errand":
+            # 浏览器代办（browser_errands）：读取 BOSS 岗位列表、绑定岗位；参数在代办记录里，绑定前已核对凭据。
+            params = {}
+            task = "执行排队的 BOSS 浏览器代办：读取已发布岗位、绑定所选岗位"
         elif mode == "browser_open":
             params = {}
             task = "打开并保留执行浏览器，不启动候选人沟通"
@@ -1048,6 +1059,11 @@ class Workbench:
         try:
             async with self.execution_lock:
                 await self._execute(job,recipe)
+            if job.get('mode')=='boss_errand':
+                # 运行期间新登记的浏览器代办不能被丢下：浏览器空闲就再起一次（browser_errands.after_run 有上限与时段判断）。
+                from . import browser_errands
+                try:await browser_errands.after_run(self,job)
+                except Exception as exc:logging.getLogger("cloakup").warning("浏览器代办续跑失败：%s",exc)
         except asyncio.CancelledError:
             if job.get('status') in ('queued','cancelling'):
                 job.update(status='cancelled',finished=time.time(),interaction=None)
@@ -1147,21 +1163,15 @@ class Workbench:
                 job["case_id"] = job["params"]["case_id"]
                 job["error"] = result["summary"] if job["status"] == "failed" else None
             elif job["mode"] == "boss_bind":
-                self.event(job, "step", "正在读取已建岗位的完整 JD")
-                snapshot = await read_job(session, job["params"]["job_url"])
-                case = self.cases.create(snapshot["source_url"], snapshot["title"])
-                self.cases.bind_job(case, snapshot)
-                job["case_id"] = case["id"]
-                self.event(job, "thinking", "AI 正在区分必备与加分条件，并起草话术和后续问题")
-                plan = await prepare_plan(LLM(self.model_client()), snapshot)
-                case.update(greeting_draft=plan["greeting"], search_plan=plan, stage="plan_review")
-                self.cases.save(case)
-                unattached = self.definitions.import_cases([case])
-                summary = "岗位已绑定，寻访计划与话术草稿已生成；平台内容未修改。"
-                if unattached:
-                    summary += "该网站与场景的寻访任务已启用验证后发布，新岗位需在该任务的草案中加入并发布后才参与寻访。"
-                job["result"] = {"success": True, "summary": summary, "result": {"case_id": case["id"], "job_title": snapshot["title"]}}
+                outcome = await self.bind_boss_job(job, session, job["params"]["job_url"])
+                job["result"] = {"success": True, "summary": outcome["summary"], "result": {"case_id": outcome["case_id"], "job_title": outcome["job_title"]}}
                 job["status"] = "succeeded"
+            elif job["mode"] == "boss_errand":
+                from .browser_errands import run_direct
+                result = await run_direct(self, job, session)
+                job["status"] = result.pop("status")
+                job["result"] = {"success": job["status"] == "succeeded", "summary": result["summary"], "result": result}
+                job["error"] = result["summary"] if job["status"] == "failed" else None
             elif recipe:
                 runner = TracedRunner(self, job, recipe=recipe, session=session, llm=LLM(self.model_client()),
                                       agent_cfg=cfg, confirm=confirm, ask=ask)
@@ -1212,6 +1222,30 @@ class Workbench:
             self.persist(job)
             self.tasks.pop(job["id"], None)
             self.gates.pop(job["id"], None)
+
+    async def bind_boss_job(self, job, session, job_url, case_id=None, encrypt_id=None):
+        """读取已建岗位 JD、建岗位档案、生成计划草稿；boss_bind 与浏览器代办（browser_errands）共用。
+
+        encrypt_id：建档前核对读到的地址仍是所选岗位（否则不建档，重试也不会多出一份）；case_id：接着用上次只建了档的半成品。"""
+        self.event(job, "step", "正在读取已建岗位的完整 JD")
+        snapshot = await read_job(session, job_url)
+        if encrypt_id is not None:
+            from urllib.parse import parse_qs, urlparse
+            if (parse_qs(urlparse(snapshot.get("source_url") or "").query).get("encryptId") or [None])[0] != encrypt_id:
+                raise SourcingError("读到的岗位地址里没有所选岗位的岗位标识（地址缺少或换了岗位），未建岗位档案")
+        case = self.cases.load(case_id) if case_id else self.cases.create(snapshot["source_url"], snapshot["title"])
+        self.cases.bind_job(case, snapshot)
+        if job.get("mode") == "boss_bind":
+            job["case_id"] = case["id"]
+        self.event(job, "thinking", "AI 正在区分必备与加分条件，并起草话术和后续问题")
+        plan = await prepare_plan(LLM(self.model_client()), snapshot)
+        case.update(greeting_draft=plan["greeting"], search_plan=plan, stage="plan_review")
+        self.cases.save(case)
+        unattached = self.definitions.import_cases([case])
+        summary = "岗位已绑定，寻访计划与话术草稿已生成；平台内容未修改。"
+        if unattached:
+            summary += "该网站与场景的寻访任务已启用验证后发布，新岗位需在该任务的草案中加入并发布后才参与寻访。"
+        return {"case_id": case["id"], "job_title": snapshot["title"], "summary": summary}
 
     async def compile(self, job):
         job.update(status="compiling", compile_error=None)
@@ -1462,6 +1496,14 @@ def make_server(manager: Workbench, port: int = 8765):
                     self.send(report)
                 elif re.fullmatch(r'/api/tasks/[a-f0-9]{32}/history',path):
                     self.send(manager.db.history('task',path.split('/')[3]))
+                elif path=='/api/boss/jobs':
+                    # 岗位选择器：最近一次从 BOSS 读到的岗位（只在本机）与绑定标注；task_id 用于标注“已在本任务／由其他任务管理”。
+                    from urllib.parse import parse_qs as _qs
+                    from .browser_errands import view as errand_view
+                    task_id=(_qs(self.path.split('?',1)[1]).get('task_id') or [None])[0] if '?' in self.path else None
+                    if task_id is not None and not re.fullmatch(r'[a-f0-9]{32}',task_id):task_id=None
+                    async def boss_jobs_view():return errand_view(manager,task_id)
+                    self.send(manager.call(boss_jobs_view()))
                 elif re.fullmatch(r'/api/tasks/[a-f0-9]{32}/jobs/changes',path):
                     from .job_changes import changes as job_changes
                     async def job_change_list():return job_changes(manager,path.split('/')[3])
@@ -1567,6 +1609,12 @@ def make_server(manager: Workbench, port: int = 8765):
                     from .faq_answers import submit as submit_faq_answer
                     async def faq_answer_action():return submit_faq_answer(manager,self.path.split('/')[3],body)
                     result=manager.call(faq_answer_action())
+                elif self.path=='/api/boss/jobs/refresh':
+                    from .browser_errands import request_refresh
+                    result=manager.call(request_refresh(manager))
+                elif self.path=='/api/boss/jobs/bind':
+                    from .browser_errands import request_bind
+                    result={'errands':manager.call(request_bind(manager,body))}
                 elif re.fullmatch(r'/api/tasks/[a-f0-9]{32}/jobs',self.path):
                     from .job_changes import request as request_job_change
                     async def job_change_action():return request_job_change(manager,self.path.split('/')[3],body)

@@ -153,6 +153,10 @@ async def open_menu(session):
     if urlparse(session.page.url).path != '/web/chat/index':
         await session.navigate(CHAT_URL)
     await _checked_menu(session)
+    # 11-25 FDE交付工程师：上一轮打开老会话后虚拟列表停在下方，顶部的新来信行不在 DOM 里，新岗位的主动招呼一直没被读到。
+    # 每次读列表前先把列表容器滚回顶部（只滚动，不点击）；在下方的已知会话仍由 include_chat_rows 滚出来。
+    if await evaluate(session, LIST_SCROLL_JS.replace('MODE', json.dumps('top'))):
+        await asyncio.sleep(.3)
     rows = await evaluate(session, ROWS_JS)
     if not rows:
         for _ in range(4):

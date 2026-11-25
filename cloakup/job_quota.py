@@ -8,7 +8,6 @@ import copy
 
 from . import job_members
 from .autonomy import day_key
-from .pacing import stable_fraction
 
 ACCOUNT_DAILY_CAP=20
 
@@ -21,9 +20,8 @@ def attempted_on(m:dict,day:str,intent:str|None=None)->bool:
 
 
 def task_target(task_id:str,limit:int,day:str)->int:
-    """任务当天首聊目标：上限的 75%～100%，按“日期+任务”稳定取值；上限大于 0 时至少 1。"""
-    if limit<=0:return 0
-    return max(1,round(limit*(0.75+0.25*stable_fraction('daily_new',day,task_id))))
+    """任务当天首聊目标：等于管理员配置的上限（11-25 管理员：每天要把首聊额度用完，不再按 75%～100% 打折）。"""
+    return max(0,limit)
 
 
 def allocate(total:int,weights:dict[str,int])->dict[str,int]:

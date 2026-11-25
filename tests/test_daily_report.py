@@ -289,3 +289,18 @@ def test_paused_page_recovery_events_are_classified_and_reported(env):
     row = next(r for r in report['anomalies'] if r['category'] == 'page_health')
     assert row['outcomes'] == {'retry': 1, 'auto_recovered': 1}
     assert 'BOSS 页面打不开' in dr.render_markdown(report)
+
+
+def test_browser_errand_events_are_classified_and_reported(env):
+    # 11-25 Task 7：执行器安全点做的浏览器代办（读取、绑定 BOSS 岗位），完成与未完成都能归类，不算暂停。
+    manager, case = env
+    done = '浏览器代办已完成：读取 BOSS 岗位列表；读到 2 个岗位，其中 1 个可在推荐页寻访'
+    failed = '浏览器代办未完成：绑定岗位「数据顾问」（岗位名称或完整 JD 未读到）；只标记这一条，任务其他工作照常'
+    assert dr._classify({'message': done}) == ('browser_errand', 'done')
+    assert dr._classify({'message': failed}) == ('browser_errand', 'failed')
+    manager.db.append('r' * 32, {'at': at('16:00'), 'kind': 'step', 'message': done})
+    manager.db.append('r' * 32, {'at': at('16:05'), 'kind': 'step', 'message': failed})
+    report = dr.build(manager.db, manager.cases.list(), DAY, tz=TZ, now=at('23:00') + 7200)
+    row = next(r for r in report['anomalies'] if r['category'] == 'browser_errand')
+    assert row['outcomes'] == {'done': 1, 'failed': 1} and row['pauses'] == 0
+    assert '浏览器代办' in dr.render_markdown(report)

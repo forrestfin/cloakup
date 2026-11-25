@@ -408,3 +408,96 @@ def test_restart_settles_job_adds_whose_validation_was_interrupted(manager):
         record=restarted.db.get('job_change','c'*32)
         assert record['status']=='failed' and '中断' in record['error']
     finally:restarted.close()
+
+
+def test_boss_job_picker_routes_read_then_bind_through_the_shared_binding(manager, monkeypatch):
+    # 11-25 Task 7：没有执行器时，刷新与绑定各起一次 BOSS 操作（boss_errand）；绑定复用 boss_bind 的读 JD → 建档 → 计划草稿。
+    from types import SimpleNamespace
+    from cloakup import boss_jobs
+    eid = 'abcDEF123456~~'
+    class Session:
+        def __init__(self, *a): self.page = SimpleNamespace(url='about:blank', frames=[]); self.context = None
+        async def start(self): pass
+        async def navigate(self, url): self.page.url = url
+        async def close(self): pass
+    async def read_published(session):
+        return {'jobs': [{'encrypt_id': eid, 'title': '数据顾问', 'detail': '上海', 'status': 'open', 'status_text': '开放中', 'recommendable': True, 'option_text': '数据顾问 上海'},
+                         {'encrypt_id': None, 'title': '交付顾问', 'detail': '北京', 'status': 'open', 'status_text': '开放中', 'recommendable': False, 'option_text': None}],
+                'read_at': 1.0, 'truncated': False, 'option_count': 1, 'row_count': 2, 'total_rows': 2}
+    async def read_job(session, url):
+        assert url == boss_jobs.job_url(eid)
+        return {'title': '数据顾问', 'requirements': '负责数据整理', 'company': '', 'location': '上海', 'source_url': url, 'source_type': 'visible_job_form', 'platform_fields': []}
+    async def prepare_plan(llm, snapshot):
+        return {'greeting': '您好，方便聊聊吗？', 'keywords': [], 'requirements': [], 'follow_up_questions': []}
+    async def guard(session): return None
+    monkeypatch.setattr(web, 'WebSession', Session);monkeypatch.setattr(boss_jobs, 'read_published', read_published)
+    monkeypatch.setattr(boss_jobs, '_guard', guard);monkeypatch.setattr(web, 'read_job', read_job);monkeypatch.setattr(web, 'prepare_plan', prepare_plan)
+    from cloakup import browser_errands, page_health
+    async def chat_check(session, kind): return {'healthy': True, 'reason': None, 'has_draft': False}
+    monkeypatch.setattr(browser_errands, 'window_open', lambda *a, **k: True);monkeypatch.setattr(page_health, 'check', chat_check)
+    server = web.make_server(manager, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    def request(path, data=None, token=None):
+        req = urllib.request.Request(base+path, data=json.dumps(data).encode() if data is not None else None, headers={'X-Cloakup-Token': token} if token else {})
+        return json.load(urllib.request.urlopen(req))
+    def wait_idle():
+        async def idle():
+            while manager.busy(): await asyncio.sleep(0.01)
+        manager.call(idle())
+    try:
+        token = request('/api/state')['token']
+        assert request('/api/boss/jobs')['jobs'] == []
+        with pytest.raises(urllib.error.HTTPError) as exc: request('/api/boss/jobs/refresh', {})
+        assert exc.value.code == 403
+        assert request('/api/boss/jobs/refresh', {}, token)['kind'] == 'job_list'
+        wait_idle()
+        listed = request('/api/boss/jobs')
+        assert [j['bindable'] for j in listed['jobs']] == [True, False] and listed['read_at'] == 1.0
+        with pytest.raises(urllib.error.HTTPError) as exc: request('/api/boss/jobs/bind', {'encrypt_ids': ['zzzzzz999999']}, token)
+        assert exc.value.code == 400
+        request('/api/boss/jobs/bind', {'encrypt_ids': [eid]}, token)
+        wait_idle()
+        job = request('/api/boss/jobs')['jobs'][0]
+        assert job['bound_case_id'] and manager.cases.load(job['bound_case_id'])['greeting_draft'] == '您好，方便聊聊吗？'
+        assert [r['mode'] for r in manager.jobs.values()] == ['boss_errand', 'boss_errand']
+        assert all(r['status'] == 'succeeded' for r in manager.jobs.values())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+async def test_bind_checks_the_job_identity_before_creating_and_resumes_a_stub(manager, monkeypatch):
+    # 11-25 审阅：读到的岗位地址没有或换了 encryptId 时不建档（重试不会多出一份）；上次只建了档时接着用那份档案。
+    from types import SimpleNamespace
+    from cloakup import boss_jobs
+    eid = 'abcDEF123456~~';url = boss_jobs.job_url(eid)
+    source = {'url': 'https://www.zhipin.com/web/chat/job/edit'}
+    async def read_job(session, job_url):
+        return {'title': '数据顾问', 'requirements': '负责数据整理', 'company': '', 'location': '上海', 'source_url': source['url'], 'source_type': 'visible_job_form', 'platform_fields': []}
+    async def prepare_plan(llm, snapshot): return {'greeting': '您好', 'keywords': [], 'requirements': [], 'follow_up_questions': []}
+    monkeypatch.setattr(web, 'read_job', read_job);monkeypatch.setattr(web, 'prepare_plan', prepare_plan)
+    job = {'id': 'e'*32, 'events': [], 'status': 'running'}
+    with pytest.raises(web.SourcingError, match='岗位标识'):await manager.bind_boss_job(job, SimpleNamespace(), url, encrypt_id=eid)
+    assert manager.cases.list() == []
+    stub = manager.cases.create(url, '待绑定岗位');source['url'] = url
+    outcome = await manager.bind_boss_job(job, SimpleNamespace(), url, case_id=stub['id'], encrypt_id=eid)
+    assert outcome['case_id'] == stub['id'] and len(manager.cases.list()) == 1 and manager.cases.load(stub['id'])['search_plan']
+
+
+async def test_finished_errand_run_starts_a_follow_up_for_late_requests(manager, monkeypatch):
+    # 11-25 审阅：代办运行结束时还有运行中新登记的代办，浏览器空闲就再起一次，不被丢下。
+    from cloakup import browser_errands
+    calls = []
+    async def after_run(m, job): calls.append(job['id'])
+    async def run_direct(m, job, session): return {'status': 'succeeded', 'summary': 'ok'}
+    class Session:
+        def __init__(self, *a): self.context = None
+        async def start(self): pass
+        async def close(self): pass
+    monkeypatch.setattr(browser_errands, 'after_run', after_run);monkeypatch.setattr(browser_errands, 'run_direct', run_direct);monkeypatch.setattr(web, 'WebSession', Session)
+    jid = (await manager.create({'mode': 'boss_errand', 'params': {}}))['id']
+    await manager.tasks[jid]
+    assert calls == [jid]

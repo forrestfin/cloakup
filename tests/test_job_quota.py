@@ -19,11 +19,10 @@ def _task(members, limit=20, tid='t1'):
     return {'id': tid, 'config': {'members': members, 'case_ids': [m['case_id'] for m in members], 'execution': {'daily_new_limit': limit}}}
 
 
-def test_task_target_is_stable_and_bounded():
-    day = '2026-11-24'
-    assert jq.task_target('t1', 20, day) == jq.task_target('t1', 20, day)
-    assert all(15 <= jq.task_target('t%d' % i, 20, day) <= 20 for i in range(50))
-    assert jq.task_target('t1', 0, day) == 0 and jq.task_target('t1', 1, day) == 1
+def test_task_target_uses_the_whole_limit_every_day():
+    # 11-25 17:4x 管理员：每天要把首聊额度用完（原为上限的 75%～100%，当天上限 20 只开了 15）。
+    assert all(jq.task_target('t%d' % i, 20, '2026-11-%02d' % d) == 20 for i in range(20) for d in range(1, 29))
+    assert jq.task_target('t1', 0, '2026-11-24') == 0 and jq.task_target('t1', 1, '2026-11-24') == 1 and jq.task_target('t1', 7, '2026-11-24') == 7
 
 
 def test_allocate_by_weight_largest_remainder():
@@ -116,9 +115,10 @@ async def test_first_contact_entry_uses_task_quota(monkeypatch):
 def test_job_removed_today_still_counts_toward_task_total():
     # 当天 b 已占位 2 次后被彻底移除：任务合计仍算上 b 的占位，不会因移除而多发
     day = day_key();cases = [_case('a', 0), _case('b', 2)];store = _store(cases)
-    limit = 20;target = jq.task_target('t1', limit, day)
+    # 目标低于账号每天 20 的硬上限，才能单独看任务合计（目标等于上限后 20 会同时撞上账号上限）
+    limit = 12;target = jq.task_target('t1', limit, day)
     cases[0]['candidates']['p']['outbox'] += [{'intent': 'first_contact', 'status': 'sent', 'claimed_at': time.time()} for _ in range(target - 2)]
-    task = _task([{'case_id': 'a', 'weight': 1, 'outreach': 'active'}])
+    task = _task([{'case_id': 'a', 'weight': 1, 'outreach': 'active'}]);task['config']['execution']['daily_new_limit'] = limit
     assert jq.allowed(store, task, 'a', day)
     task['config']['removed_today'] = [{'case_id': 'b', 'day': day}]
     assert jq.counted_case_ids(task['config'], day) == ['a', 'b']

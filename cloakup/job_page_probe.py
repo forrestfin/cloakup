@@ -176,8 +176,12 @@ async def _guard(manager, session, stage):
         raise ProbeStopped('verification_required', stage)
 
 
-async def _settle(session, ready):
-    for _ in range(16):
+TEXT_LEN='((document.body&&document.body.innerText)||"").trim().length'
+JOB_FRAME='/web/frame/job'
+
+
+async def _settle(session, ready, tries=16):
+    for _ in range(tries):
         if await ready():return True
         await asyncio.sleep(jitter(.5, .2))
     return False
@@ -215,9 +219,16 @@ async def _open_job_list(manager, session, capture, tokens, titles):
     else:
         raise ProbeStopped('job_menu_not_clickable', 'job_list')
     async def ready():
-        value=await _read_main(session, '((document.body&&document.body.innerText)||"").trim().length')
-        return session.page.url!=CHAT_URL and isinstance(value,int) and value>300 or (session.page.url!=before and bool(_site_frames(session)))
-    settled=await _settle(session, ready)
+        # 11-25 实采：列表 frame 先以空的 <div id="app"> 出现，要等 frame 里有文字才算加载好
+        if session.page.url in (CHAT_URL, before):return False
+        frames=[f for f in _site_frames(session) if JOB_FRAME in f.url]
+        if not frames:
+            value=await _read_main(session, TEXT_LEN)
+            return isinstance(value,int) and value>300
+        try:value=await _read_frame(session, frames[0], TEXT_LEN)
+        except Exception:return False
+        return isinstance(value,int) and value>20
+    settled=await _settle(session, ready, tries=30)
     await asyncio.sleep(jitter(1.5, .2))
     await _guard(manager, session, 'job_list')
     capture['job_list']={'settled':settled,**await _dump_page(session, tokens, titles)}
