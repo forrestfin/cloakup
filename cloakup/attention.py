@@ -17,6 +17,9 @@ def answered(person,reply_id):
     from .decision_runtime import answer_sent
     return answer_sent(person,reply_id,statuses=('sent',))
 
+# 让管理员在执行浏览器里点击、输入时，说明怎样拿到控制权（noVNC 默认只读）。
+BROWSER_CONTROL='打开执行浏览器 http://127.0.0.1:6080/vnc.html?autoconnect=1&resize=scale&view_only=0 操作（如果画面只能看不能点，在 noVNC 左侧设置里关掉 View Only）'
+
 # 会话被隔离超过这么久仍打不开，才提醒管理员（之前一直由系统自动重试）。
 ISOLATED_TODO_SECONDS = 24 * 3600
 # 岗位变更排队超过这么久仍未到执行器安全点才提醒；同一岗位当天推荐页入口失败达到这么多次才提醒。
@@ -181,16 +184,62 @@ class AttentionStore:
         # 执行浏览器页面：自动刷新、重置都没修好，或页面上有没发出去的文字（系统不会替你删或发）。
         try:health=self.db.get('page_health','boss')
         except FileNotFoundError:health=None
-        if health and not health.get('healthy') and time.time()-health.get('at',0)<24*3600:
+        # 11-24 20:40 沟通页卡在启动页：系统因页面打不开暂停的任务，按暂停期间自愈的真实状态写明会不会自动恢复。
+        from .selection_recovery import page_blocked,page_stuck,PAGE_PROBLEMS,PAGE_MAX_ATTEMPTS
+        from .page_health import done_steps
+        page_members=[m for m in members if page_blocked(m)]
+        if page_members:
+            try:recovery=self.db.get('page_recovery','boss')
+            except FileNotFoundError:recovery={}
+            paused_at=max(m['history'][-1]['at'] for m in page_members)
+            # 执行器还没为这次暂停建立记录时，按当前页面检查推断，不沿用旧的尝试次数与结果。
+            if recovery.get('paused_at')!=paused_at:
+                recovery={'attempts':0,'next_at':paused_at+600,'page_stuck':page_stuck(health,paused_at),'steps':(health or {}).get('steps') or []}
+            # 暂停期间的自愈由运行中的账号执行器完成；执行器没在运行（例如服务重启后）就没有人重试，必须照实说。
+            runner=any(r.get('account_runner') and r.get('status') in ('running','waiting') for r in runs)
+            from datetime import datetime
+            from .daily_report import report_timezone
+            def clock(ts):return datetime.fromtimestamp(ts,report_timezone()).strftime('%H:%M') if ts else '稍后'
+            labels='、'.join(filter(None,(case_labels.get(cid,'') for m in page_members for cid in m.get('case_ids',[]))))
+            attempts=recovery.get('attempts',0)
+            done=done_steps(recovery.get('steps')) or '自动处理页面'
+            detail=('BOSS 沟通页打不开（停在启动页、“加载中”或内容读不到），系统无法确认输入框里有没有没发出去的文字，已于 '+clock(paused_at)+' 暂停任务'+('「'+labels+'」' if labels else '')+'，没有发送任何消息。'
+                    '已做：'+done+('；暂停后又自动检查 '+str(attempts)+' 次' if attempts else '')+'。')
+            manual='需要：'+BROWSER_CONTROL+'，确认沟通页正常（可从左侧菜单“消息”进入）后，在任务页手动恢复任务；恢复时会先检查页面并只读核对原会话，恢复后此待办自动解除。'
+            result=recovery.get('result')
+            if not runner:
+                detail+='现在账号执行器没有在运行（例如服务刚重启），系统不会自动重试。'+manual
+            elif not recovery.get('page_stuck'):
+                detail+='暂停前的页面检查没有显示页面卡住（可能是编辑器本身读不到），这种情况系统不会自动重试。'+manual
+            elif result=='capped':
+                detail+=str(recovery.get('reason') or '自动尝试次数已用完')+'，系统已停止自动重试。'+manual
+            elif result=='precondition':
+                detail+='任务恢复会被拒绝（'+str(recovery.get('reason'))+'），刷新页面解决不了，所以页面恢复后也无法自动恢复任务，系统没有再去碰页面。需要：先按原因处理（例如重新验收发布、运行环境检查），再在任务页手动恢复。'
+            elif result=='needs_admin':
+                detail+=('暂停期间检查发现：'+PAGE_PROBLEMS.get(recovery.get('reason'),str(recovery.get('reason')))+'。在你处理之前系统不会自动恢复任务。'
+                         '需要：'+BROWSER_CONTROL+'处理；处理好后，系统下次检查（约 '+clock(recovery.get('next_at'))+'）确认页面正常就会自动恢复，也可以直接在任务页手动恢复。恢复后此待办自动解除。')
+            elif result=='resume_failed':
+                detail+=('页面已恢复正常，但任务未能自动恢复（'+str(recovery.get('reason') or '原因未记录')+'）。'
+                         +('系统会在下次检查时再试（约 '+clock(recovery.get('next_at'))+'，已试 '+str(attempts)+'/'+str(PAGE_MAX_ATTEMPTS)+' 次）；也可以按原因处理后在任务页手动恢复。' if attempts<PAGE_MAX_ATTEMPTS
+                           else '自动尝试次数已用完，系统已停止自动重试。需要：按原因处理后在任务页手动恢复。')+'恢复后此待办自动解除。')
+            else:
+                when=('现在不在任务执行时段，系统不操作网站；进入时段后（约 '+clock(recovery.get('outside_window_until'))+'）自动再试。' if recovery.get('outside_window_until')
+                      else '执行时段内前 3 次约每 10 分钟、之后约每 30 分钟自动再试，最多 '+str(PAGE_MAX_ATTEMPTS)+' 次（已试 '+str(attempts)+' 次，下次约 '+clock(recovery.get('next_at'))+'）。')
+                detail+=(when+'页面恢复、并确认没有草稿、没有掉登录或验证后，系统会自动恢复任务并先只读核对原会话，此待办自动解除。'
+                         '一般不用处理；如长时间未恢复，可以'+BROWSER_CONTROL+'，从左侧菜单“消息”进入沟通页，页面正常后系统会自动恢复。')
+            add('browser_health:paused:'+','.join(sorted(m['id'] for m in page_members))+':'+str(paused_at),'browser_health','BOSS 沟通页打不开，任务已暂停',detail,
+                task_id=page_members[0]['id'],job_label=labels,screenshot=(health or {}).get('screenshot'))
+        elif health and not health.get('healthy') and time.time()-health.get('at',0)<24*3600:
             if health.get('reason')=='draft_present':
                 add('browser_health:draft:'+str(int(health['at']//3600)),'browser_health','执行浏览器里有一段没发出去的文字',
                     'BOSS 沟通页的输入框里有一段还没发送的文字。为了不丢掉它，系统不会刷新页面，也不会替你发送，这期间自动处理会受影响。'
-                    '请打开执行浏览器（http://127.0.0.1:6080）看一下这段文字：需要就手动发出去，不需要就删掉。处理完系统会自动继续，此待办自动解除。',screenshot=health.get('screenshot'))
+                    '请'+BROWSER_CONTROL+'，看一下这段文字：需要就手动发出去，不需要就删掉。处理完系统会自动继续，此待办自动解除。',screenshot=health.get('screenshot'))
             elif health.get('exhausted'):
+                running=any(m.get('status')=='running' for m in members)
                 add('browser_health:exhausted:'+str(int(health['at']//3600)),'browser_health','执行浏览器的 BOSS 页面打不开',
-                    'BOSS '+('沟通页' if health.get('kind')=='chat' else '推荐牛人页')+'一直停在“加载中”或内容出不来。系统已自动刷新 2 次、重新打开标签页 1 次，仍然不行；'
-                    '每 10 分钟会再自动试一次。收件、回复或开聊会暂时受影响。'
-                    '请打开执行浏览器（http://127.0.0.1:6080）看一下画面：如果 BOSS 提示网络异常或要求重新登录，按页面提示处理；页面恢复正常后此待办自动解除。',screenshot=health.get('screenshot'))
+                    'BOSS '+('沟通页' if health.get('kind')=='chat' else '推荐牛人页')+'一直停在“加载中”或内容出不来。系统已'+(done_steps(health.get('steps')) or '自动处理')+'，仍然不行；'
+                    +('任务仍在运行，执行器约 10 分钟后会自动再试。收件、回复或开聊会暂时受影响。' if running else '目前没有运行中的任务，系统不会自动重试；恢复任务后执行器会先检查页面。')+
+                    '请'+BROWSER_CONTROL+'，看一下画面：可以从左侧菜单“消息”进入沟通页；如果 BOSS 提示网络异常或要求重新登录，按页面提示处理；页面恢复正常后此待办自动解除。',screenshot=health.get('screenshot'))
         for case in cases:
             # 会话相关待办只发管理员能处理的，并用大白话写清楚“发生了什么、系统做了什么、你可以做什么”。
             def person_of(chat_id,case=case):

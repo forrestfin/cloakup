@@ -51,6 +51,7 @@ CATEGORIES = {
     'notification': ('飞书通知未送达', 'partial', '可重试错误自动重试；结果未知不重发，需人工核对'),
     'task_error': ('任务异常停止', 'manual', '查看错误记录后恢复任务'),
     'job_change': ('岗位变更生效', 'auto', '加入、撤下、移除岗位与调整权重、总额在执行器安全点生效；加入的岗位须先通过本岗位隔离验收，未生效时生成待办'),
+    'page_health': ('BOSS 页面打不开', 'partial', '执行中自动刷新、重开标签页、从左侧菜单进入；因此暂停的任务在执行时段内按间隔再试（每次暂停最多 6 次、每天每任务最多自动恢复 3 次），页面确认安全后自动恢复并先只读核验原会话；有草稿、掉登录、验证或发布未验收需管理员处理'),
     'service_restart': ('服务重启', 'partial', '重启后自动核验环境并恢复原先运行的任务；核验不通过时保持暂停并写明原因'),
 }
 FIXABILITY = {'auto': '可自动修复', 'partial': '部分可自动修复', 'manual': '需人工处理'}
@@ -60,6 +61,12 @@ EVENT_RULES = [
     ('selection', 'auto_recovered', ('msg', '会话选择已恢复')),
     ('selection', 'isolated', ('msg', '已先放下')),
     ('selection', 'paused', ('re', r'恢复核验 \d+/\d+')),
+    ('page_health', 'auto_recovered', ('msg', '系统已自动恢复任务')),
+    ('page_health', 'retry', ('msg', '沟通页仍打不开')),
+    ('page_health', 'manual', ('msg', '暂停期间检查沟通页')),
+    ('page_health', 'manual', ('msg', '任务未能自动恢复')),
+    ('page_health', 'manual', ('msg', '页面恢复后也无法自动恢复任务')),
+    ('page_health', 'stopped', ('msg', '沟通页自动恢复已停止自动重试')),
     ('isolation', 'outreach_held', ('msg', '岗位有未核实的隔离会话')),
     ('outreach_entry', 'retry', ('msg', '主动开聊入口暂不可用')),
     ('outreach', 'job_exhausted', ('msg', '额度让给其他岗位')),

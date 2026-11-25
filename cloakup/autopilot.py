@@ -20,6 +20,7 @@ from .boss_recommend import (open_list, open_profile, card_fingerprint, job_iden
                              BossRecommendContact, RECOMMEND_URL, close_profile, verify_list, read_cards)
 from .llm import LLM
 from .pacing import jitter, lognormal, stable_fraction
+from .logbook import log
 from .sourcing import SourcingError, TERMINAL
 from . import job_members, job_quota
 from .job_quota import attempted_on
@@ -843,6 +844,146 @@ async def check_page_health(session):
         return None
 
 
+async def _chat_guard(session):
+    """自愈后再用恢复核验的同一份只读检查确认沟通页：没有未发送的草稿、没有登录或验证、会话列表或编辑器读得到。返回问题原因或 None。"""
+    page=getattr(session,'page',None)
+    if not boss_chat.is_chat_page(page):return 'page_changed'
+    try:state=await boss_chat._settled_guard_state(page)
+    except asyncio.CancelledError:raise
+    except Exception:return 'editor_unavailable'
+    if not isinstance(state,dict):return 'editor_unavailable'
+    if state.get('login'):return 'login_required'
+    if state.get('challenge'):return 'verification_required'
+    if state.get('has_draft'):return 'draft_present'
+    # 与 recover_chat_selection 一致：没读到草稿字段、或列表和编辑器都没有，视为无法核验编辑器。
+    if 'has_draft' not in state or (not state.get('editor_count') and not state.get('chat_rows')):return 'editor_unavailable'
+    return None
+
+
+def _page_retry_delay(attempts):
+    from .selection_recovery import PAGE_RETRY_SECONDS,PAGE_RETRY_MAX,PAGE_BACKOFF_SECONDS,PAGE_BACKOFF_MAX,PAGE_FAST_ATTEMPTS
+    if attempts<PAGE_FAST_ATTEMPTS:return min(jitter(PAGE_RETRY_SECONDS),PAGE_RETRY_MAX)
+    return min(jitter(PAGE_BACKOFF_SECONDS),PAGE_BACKOFF_MAX)
+
+
+async def heal_paused_tasks_safely(manager,job,session):
+    """执行器每轮都会调自动恢复：这里的任何意外只记日志，不能让执行器整个停掉（取消照常向上传）。"""
+    try:await heal_paused_tasks(manager,job,session)
+    except asyncio.CancelledError:raise
+    except Exception as exc:log('state',type='page_recovery',step='error',run_id=(job or {}).get('id'),error_type=type(exc).__name__,error=str(exc)[:200])
+
+
+async def heal_paused_tasks(manager,job,session):
+    """11-24 20:40 沟通页卡在启动页：系统因页面打不开暂停的任务，按间隔自愈；页面确认安全后由系统恢复任务。
+
+    待机和运行中的安全点都会调用。只在执行时段内、暂停前页面检查确实卡住时操作；先查刷新修不好的恢复前置条件；
+    次数有上限，用完即停并交给管理员。整个自愈、复核和恢复期间持有浏览器诊断锁。恢复后原会话由 resume_verification 只读复核，不发送任何消息。"""
+    from .selection_recovery import page_blocked,page_stuck,page_resumes_today,PAGE_PROBLEMS,PAGE_CAPS,PAGE_MAX_ATTEMPTS,PAGE_DAILY_ATTEMPTS,PAGE_DAILY_RESUMES
+    from .task_policy import window_status
+    from . import page_health
+    account=manager.account_execution;db=getattr(account,'db',None);now=time.time()
+    members=[m for m in account.members() if page_blocked(m)]
+    if db is None:return None
+    try:doc=db.get('page_recovery','boss')
+    except FileNotFoundError:doc={}
+    daily={'day':doc.get('day'),'day_attempts':doc.get('day_attempts',0)}
+    if not members:
+        if doc.get('task_ids'):db.put('page_recovery','boss',{'id':'boss','task_ids':[],'updated_at':now,**daily})
+        return None
+    ids=sorted(m['id'] for m in members);paused_at=max(m['history'][-1]['at'] for m in members)
+    def save(**fields):
+        doc.update(updated_at=time.time(),**fields);db.put('page_recovery','boss',doc)
+    def announce(result,message):
+        if doc.get('announced')==result:return
+        save(announced=result);manager.event(job,'step',message)
+    if doc.get('task_ids')!=ids or doc.get('paused_at')!=paused_at:
+        try:health=db.get('page_health','boss')
+        except FileNotFoundError:health=None
+        # 刚暂停时页面自愈刚用尽，先隔一个间隔再试；记下暂停前页面检查的结论和已做过的步骤。
+        doc={'id':'boss','task_ids':ids,'paused_at':paused_at,'attempts':0,'next_at':paused_at+_page_retry_delay(0),
+             'page_stuck':page_stuck(health,paused_at),'steps':list((health or {}).get('steps') or []),**daily}
+        save()
+    if not doc.get('page_stuck') or doc.get('result')=='capped':return None
+    def window(member,at):
+        try:schedule=db.get('task',member['id'])['config'].get('schedule')
+        except (FileNotFoundError,KeyError):schedule=None
+        return window_status(schedule,at) if schedule else {'allowed':True,'next_at':None}
+    states={m['id']:window(m,now) for m in members}
+    ready=[m for m in members if states[m['id']]['allowed']]
+    if not ready:
+        until=min((s['next_at'] for s in states.values() if s.get('next_at')),default=None)
+        if doc.get('outside_window_until')!=until:save(outside_window_until=until)
+        return None
+    if doc.get('outside_window_until'):save(outside_window_until=None)
+    if now<doc.get('next_at',0):return None
+    # 刷新页面修不好的前置条件（发布验收、环境核验等）会让恢复被拒绝：不去碰页面，交给管理员。
+    blocker=getattr(manager,'resume_blocker',None)
+    blockers={m['id']:blocker(m['id']) if blocker else None for m in ready}
+    healable=[m for m in ready if not blockers[m['id']]]
+    if not healable:
+        reason=next(iter(blockers.values()))
+        save(result='precondition',reason=reason,next_at=now+_page_retry_delay(doc.get('attempts',0)))
+        log('state',type='page_recovery',step='precondition',task_ids=ids,reason=reason)
+        announce('precondition','沟通页暂停期间未自动检查：任务恢复会被拒绝（'+str(reason)+'），页面恢复后也无法自动恢复任务；请管理员处理后手动恢复')
+        return None
+    from .autonomy import day_key
+    day=day_key(now)
+    if doc.get('day')!=day:doc.update(day=day,day_attempts=0)
+    healable=[m for m in healable if page_resumes_today(m,day)<PAGE_DAILY_RESUMES]
+    cap=('daily_resumes' if not healable else 'incident' if doc.get('attempts',0)>=PAGE_MAX_ATTEMPTS
+         else 'daily_attempts' if doc.get('day_attempts',0)>=PAGE_DAILY_ATTEMPTS else None)
+    if cap:
+        save(result='capped',cap=cap,reason=PAGE_CAPS[cap])
+        log('state',type='page_recovery',step='capped',task_ids=ids,cap=cap,attempts=doc.get('attempts'))
+        announce('capped','沟通页自动恢复已停止自动重试：'+PAGE_CAPS[cap]+'；任务保持暂停，请管理员检查执行浏览器后手动恢复')
+        return None
+    # 环境检查或执行器诊断正在用这个浏览器：这次不碰页面。自己开始后整个过程持有同一把锁。
+    lock=getattr(manager,'_browser_diagnostic_lock',None)
+    if lock is None:lock=manager._browser_diagnostic_lock=asyncio.Lock()
+    preflight=getattr(manager,'preflight_task',None)
+    if lock.locked() or (preflight is not None and not preflight.done()):return None
+    # 运行中的执行器每轮也会自愈页面：它刚用尽（冷却中）就先不再跑一遍，等冷却过了再试，避免短时间内反复刷新。
+    if time.time()-(getattr(session,'_page_health_exhausted_at',None) or 0)<page_health.COOLDOWN_SECONDS:return None
+    async with lock:
+        save(attempts=doc.get('attempts',0)+1,day_attempts=doc.get('day_attempts',0)+1,last_at=now)
+        log('state',type='page_recovery',step='attempt',attempt=doc['attempts'],task_ids=ids)
+        try:state=await page_health.heal(session,'chat',force=True)
+        except asyncio.CancelledError:raise
+        except Exception as exc:state={'healthy':False,'reason':'heal_failed','needs_admin':False,'has_draft':False,'error':type(exc).__name__}
+        problem=None if state.get('healthy') and not state.get('has_draft') else state.get('reason') or 'unhealthy'
+        if state.get('has_draft'):problem='draft_present'
+        if problem is None:problem=await _chat_guard(session)
+        now=time.time()
+        if problem:
+            result='needs_admin' if problem in PAGE_PROBLEMS else 'unhealthy'
+            save(result=result,reason=problem,next_at=now+_page_retry_delay(doc['attempts']))
+            log('state',type='page_recovery',step='still_blocked',attempt=doc['attempts'],reason=problem,task_ids=ids,next_at=doc['next_at'])
+            announce(result,'暂停期间检查沟通页：'+PAGE_PROBLEMS[problem]+'；处理前系统不自动恢复任务，请管理员在执行浏览器处理；处理后下次检查页面正常会自动恢复，也可手动恢复' if result=='needs_admin'
+                     else '沟通页仍打不开，任务保持暂停；执行时段内按间隔自动再试（最多 '+str(PAGE_MAX_ATTEMPTS)+' 次），页面恢复且确认没有草稿后自动恢复任务')
+            return state
+        resumed=[];failed={}
+        # 自愈期间管理员可能已手动恢复或暂停、也可能走出了执行时段：恢复前逐项重新核对。
+        still={m['id'] for m in account.members() if page_blocked(m)}
+        for member in healable:
+            if member['id'] not in still or not window(member,time.time())['allowed']:continue
+            reason=blocker(member['id']) if blocker else None
+            if reason:failed[member['id']]=reason;continue
+            try:
+                # 与管理员恢复走同一入口（发布版本、环境核验等前置检查不变），只是记为系统恢复。
+                await manager.start_account_task(member['id'],actor='system',reason='page_recovered')
+                resumed.append(member['id'])
+            except asyncio.CancelledError:raise
+            except Exception as exc:failed[member['id']]=str(exc)[:200] if isinstance(exc,ValueError) else type(exc).__name__
+        retrying=doc['attempts']<PAGE_MAX_ATTEMPTS
+        save(result='resume_failed' if failed else 'resumed' if resumed else 'unhealthy',reason='；'.join(failed.values()) or None,next_at=now+_page_retry_delay(doc['attempts']))
+        log('state',type='page_recovery',step='resumed',attempt=doc['attempts'],task_ids=resumed,failed=failed,healed_by=state.get('healed_by'))
+        if resumed:manager.event(job,'step','BOSS 沟通页已恢复正常，系统已自动恢复任务；原会话先只读核验，未发送任何消息')
+        if failed:
+            announce('resume_failed','沟通页已恢复正常，但任务未能自动恢复（'+'；'.join(failed.values())+'）；'
+                     +('系统会在下次检查时再试（已试 '+str(doc['attempts'])+'/'+str(PAGE_MAX_ATTEMPTS)+' 次），也可在任务页手动恢复' if retrying else '已停止自动重试，请管理员在任务页手动恢复'))
+        return state
+
+
 def _outreach_ready(manager,job,cid,held,due):
     """该岗位本轮能否开首聊批次：未被放下、可发送、无隔离会话、话术核验已到期、自动化与开聊开关打开。只影响本轮，不记作当天无人可联系。"""
     if cid in held or not manager.account_execution.can_send(cid):return False
@@ -923,6 +1064,8 @@ async def run_account_executor(manager,job,session):
                 job.update(autopilot_stage=idle_stage,active_case_id=None,next_check_at=None)
                 manager.event(job,'step','所有任务已暂停或结束，执行器待机；保留浏览器，不操作网站')
                 manager.persist(job)
+            # 只有“系统因页面打不开而暂停”的任务会在执行时段内定时自愈，其他暂停不碰网站。
+            await heal_paused_tasks_safely(manager,job,session)
             await asyncio.sleep(1)
             continue
         available=[cid for cid in ids if manager.account_execution.can_send(cid)]
@@ -945,6 +1088,8 @@ async def run_account_executor(manager,job,session):
         job['case_results']=held.copy();job['inbound_resume_cases']=[]
         # 每轮开始前对当前 BOSS 页做一次只读健康检查；卡在加载等情况先自愈，掉登录、验证交给后续读取按原流程处理。
         await check_page_health(session)
+        # 安全点：其他任务在运行时，系统因页面打不开而暂停的任务同样按间隔自愈、恢复（规则与待机时相同）。
+        await heal_paused_tasks_safely(manager,job,session)
         # Paused memberships perform no browser operations, including reads.
         for cid in ids:
             await manager.checkpoint(job)

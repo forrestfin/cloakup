@@ -253,6 +253,18 @@ async def test_model_validation_cannot_replace_executor_readiness(setup):
         await Workbench.start_account_task(m,task['id'])
 
 
+async def test_resume_blocker_reports_what_a_start_would_refuse(setup):
+    # 复审：系统自动恢复前先查刷新页面修不好的前置条件（发布验收、环境核验），会被拒绝就不碰页面
+    from cloakup.workbench import Workbench
+    lab,m,task,case=setup
+    draft=lab.draft(task['id'],{});test=passing_test(lab,draft)
+    lab.publish(task['id'],{'draft_id':draft['id'],'expected_revision':draft['revision'],'test_id':test['id']})
+    m.latest_readiness=lambda:{'executor_current':False}
+    assert '模型验收不能代替浏览器执行核验' in Workbench.resume_blocker(m,task['id'])
+    m.latest_readiness=lambda:{'executor_current':True}
+    assert Workbench.resume_blocker(m,task['id']) is None
+
+
 def two_jobs(lab,m,t,c):
     other=m.cases.create('https://www.zhipin.com/web/chat/job-list');m.cases.bind_job(other,{'title':'交付顾问','requirements':'负责候选人交付。支持远程协作。'})
     other['anonymous_job']={'role':'交付顾问','requirements':['负责候选人交付。','支持远程协作。']};m.cases.set_autonomy(other,True,source='test');m.cases.save(other)

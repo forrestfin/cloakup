@@ -26,6 +26,46 @@ BLOCK_REASONS = {
 }
 
 
+# 11-24 20:40 沟通页卡在启动页：系统因“无法核验编辑器”（页面打不开）暂停的任务，暂停期间在执行时段内定时自愈，
+# 页面确认安全后由系统恢复。前 3 次约每 PAGE_RETRY_SECONDS 秒（不超过 PAGE_RETRY_MAX），之后约每 PAGE_BACKOFF_SECONDS 秒
+# （不超过 PAGE_BACKOFF_MAX）；同一次暂停最多 PAGE_MAX_ATTEMPTS 次，每天最多 PAGE_DAILY_ATTEMPTS 次；
+# 同一任务每天最多自动恢复 PAGE_DAILY_RESUMES 次，防止反复暂停、恢复。用完即停，由管理员处理。
+# 管理员暂停、登录、验证、草稿等原因的暂停一律不自动恢复。
+PAGE_BLOCK_REASON = 'selection_blocked:editor_unavailable'
+PAGE_RETRY_SECONDS = 600
+PAGE_RETRY_MAX = 900
+PAGE_BACKOFF_SECONDS = 1800
+PAGE_BACKOFF_MAX = 2700
+PAGE_FAST_ATTEMPTS = 3
+PAGE_MAX_ATTEMPTS = 6
+PAGE_DAILY_ATTEMPTS = 12
+PAGE_DAILY_RESUMES = 3
+PAGE_STUCK_REASONS = ('loading_stuck', 'content_missing')
+# 暂停期间自愈时发现、必须管理员处理的页面问题（给管理员的说明）。
+PAGE_PROBLEMS = {'draft_present': '发现输入框里有没发出去的文字', 'login_required': '登录已失效', 'verification_required': '平台要求验证'}
+# 停止自动重试的原因（给管理员的说明）。
+PAGE_CAPS = {'incident': '本次暂停已自动尝试 ' + str(PAGE_MAX_ATTEMPTS) + ' 次仍未恢复',
+             'daily_attempts': '今天已自动尝试 ' + str(PAGE_DAILY_ATTEMPTS) + ' 次',
+             'daily_resumes': '该任务今天已因页面问题自动恢复 ' + str(PAGE_DAILY_RESUMES) + ' 次又被暂停'}
+
+
+def page_blocked(member):
+    """任务当前是否正处于“系统因页面打不开而暂停”。"""
+    last = (member.get('history') or [{}])[-1]
+    return member.get('status') == 'paused' and last.get('actor') == 'system' and last.get('reason') == PAGE_BLOCK_REASON
+
+
+def page_stuck(health, paused_at=None):
+    """最近一次页面检查是否显示页面卡住（卡在加载、内容缺失或自愈用尽）。计划的第二个条件：编辑器读不到不一定是页面卡住。
+    给了暂停时间时，只认暂停前 15 分钟以内的检查结论，旧的“用尽”记录不能让无关的暂停被自动处理。"""
+    if paused_at is not None and (health or {}).get('at', 0) < paused_at - 900:return False
+    return bool(health) and not health.get('healthy') and (bool(health.get('exhausted')) or health.get('reason') in PAGE_STUCK_REASONS)
+
+
+def page_resumes_today(member, day):
+    from .autonomy import day_key
+    return sum(1 for h in member.get('history') or [] if h.get('reason') == 'page_recovered' and h.get('status') == 'running' and day_key(h.get('at')) == day)
+
 
 # 一条会话刚被隔离时，先暂缓新开聊，给只读复核留出时间；超过这个时长仍未核实，
 # 只把这一条留在隔离里（并生成管理员待办），不再拦整个岗位的新开聊。

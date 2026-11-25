@@ -425,3 +425,116 @@ def test_malformed_outreach_deferrals_do_not_break_reconcile(tmp_path,value):
     if isinstance(value,dict):value={day_key() if k=='TODAY' else k:v for k,v in value.items()}
     run={'id':'r','status':'running','account_runner':True,'created':1,'outreach_deferrals':value}
     assert not [t for t in s.reconcile([run],[]) if t['kind']=='job_outreach_blocked']
+
+
+# 11-24 20:40 沟通页卡在启动页：任务被系统暂停后执行器不再重试，待办却写“每 10 分钟会再自动试一次”。待办文字按真实状态写。
+RUNNER=[{'id':'r'*32,'account_runner':True,'status':'running','created':1}]
+
+
+def _stuck_page(db,at):
+    db.put('page_health','boss',{'id':'boss','at':at,'healthy':False,'reason':'content_missing','exhausted':True,'kind':'chat'})
+
+
+def test_page_blocked_pause_todo_tells_the_truth_and_closes_on_auto_resume(tmp_path):
+    import time
+    from cloakup.account_execution import AccountExecution
+    db=Database(tmp_path);s=AttentionStore(db);a=AccountExecution(db);now=time.time()
+    a.set_task('task',['case'],'paused',actor='system',reason='selection_blocked:editor_unavailable');_stuck_page(db,now)
+    db.put('page_recovery','boss',{'id':'boss','task_ids':['task'],'paused_at':a.members()[0]['history'][-1]['at'],'page_stuck':True,'attempts':2,'next_at':now+400,'result':'unhealthy','reason':'content_missing'})
+    todos=[t for t in s.reconcile(RUNNER,[]) if t['kind']=='browser_health' and t['status']!='resolved']
+    assert len(todos)==1 and '已暂停' in todos[0]['title']
+    detail=todos[0]['detail']
+    assert '每 10 分钟' in detail and '下次约' in detail and '自动恢复任务' in detail and '127.0.0.1:6080' in detail and '已试 2 次' in detail
+    with pytest.raises(ValueError):s.update(todos[0]['id'],{'status':'resolved','note':'x'})
+    a.set_task('task',['case'],'running',actor='system',reason='page_recovered')
+    db.put('page_health','boss',{'id':'boss','at':time.time(),'healthy':True})
+    assert all(t['status']=='resolved' for t in s.reconcile(RUNNER,[]) if t['kind']=='browser_health')
+
+
+def test_page_blocked_pause_without_a_running_executor_asks_for_a_manual_resume(tmp_path):
+    # 11-24 20:40 沟通页卡在启动页：执行器没在运行（如服务重启后）就没有人重试，不能写“每 10 分钟”
+    import time
+    from cloakup.account_execution import AccountExecution
+    db=Database(tmp_path);s=AttentionStore(db);a=AccountExecution(db)
+    a.set_task('task',['case'],'paused',actor='system',reason='selection_blocked:editor_unavailable');_stuck_page(db,time.time())
+    [todo]=[t for t in s.reconcile([],[]) if t['kind']=='browser_health']
+    assert '不会自动重试' in todo['detail'] and '每 10 分钟' not in todo['detail'] and '手动恢复' in todo['detail']
+
+
+def test_page_blocked_pause_outside_the_window_says_when_it_will_retry(tmp_path):
+    import time
+    from cloakup.account_execution import AccountExecution
+    db=Database(tmp_path);s=AttentionStore(db);a=AccountExecution(db);now=time.time()
+    a.set_task('task',['case'],'paused',actor='system',reason='selection_blocked:editor_unavailable');_stuck_page(db,now)
+    db.put('page_recovery','boss',{'id':'boss','task_ids':['task'],'paused_at':a.members()[0]['history'][-1]['at'],'page_stuck':True,'attempts':0,'next_at':now+60,'outside_window_until':now+3600})
+    [todo]=[t for t in s.reconcile(RUNNER,[]) if t['kind']=='browser_health']
+    assert '执行时段' in todo['detail'] and '不操作网站' in todo['detail']
+
+
+def test_page_blocked_pause_needing_the_admin_says_it_will_not_resume(tmp_path):
+    import time
+    from cloakup.account_execution import AccountExecution
+    db=Database(tmp_path);s=AttentionStore(db);a=AccountExecution(db);now=time.time()
+    a.set_task('task',['case'],'paused',actor='system',reason='selection_blocked:editor_unavailable');_stuck_page(db,now)
+    db.put('page_recovery','boss',{'id':'boss','task_ids':['task'],'paused_at':a.members()[0]['history'][-1]['at'],'page_stuck':True,'attempts':1,'next_at':now+600,'result':'needs_admin','reason':'login_required'})
+    [todo]=[t for t in s.reconcile(RUNNER,[]) if t['kind']=='browser_health']
+    assert '不会自动恢复' in todo['detail'] and '登录已失效' in todo['detail']
+
+
+@pytest.mark.parametrize('status,claim',[('running',True),('paused',False)])
+def test_stuck_page_todo_only_promises_retries_while_a_task_runs(tmp_path,status,claim):
+    # 11-24 20:40 沟通页卡在启动页：管理员暂停的任务不会自动重试，不能写“每 10 分钟会再自动试一次”
+    import time
+    from cloakup.account_execution import AccountExecution
+    db=Database(tmp_path);s=AttentionStore(db);a=AccountExecution(db)
+    a.set_task('task',['case'],status,actor='admin',reason='manual');_stuck_page(db,time.time())
+    [todo]=[t for t in s.reconcile([],[]) if t['kind']=='browser_health']
+    assert ('会自动再试' in todo['detail'])==claim and ('不会自动重试' in todo['detail'])==(not claim)
+    assert '从左侧菜单' in todo['detail']
+
+
+# 复审：待办“已做”只写实际做过的步骤；何时停止重试、为什么停、要不要人处理都照实写；让管理员点击时说明怎样拿到控制权。
+CONTROL='view_only=0'
+
+
+def _paused(tmp_path,doc=None,health=None,runs=RUNNER):
+    import time
+    from cloakup.account_execution import AccountExecution
+    db=Database(tmp_path);s=AttentionStore(db);a=AccountExecution(db);now=time.time()
+    a.set_task('task',['case'],'paused',actor='system',reason='selection_blocked:editor_unavailable')
+    db.put('page_health','boss',{'id':'boss','at':now,'healthy':False,'reason':'content_missing','exhausted':True,'kind':'chat','steps':['reload','reload','tab_reset'],**(health or {})})
+    if doc is not None:db.put('page_recovery','boss',{'id':'boss','task_ids':['task'],'paused_at':a.members()[0]['history'][-1]['at'],'attempts':0,'next_at':now+600,'page_stuck':True,'steps':['reload','reload','tab_reset'],**doc})
+    [todo]=[t for t in s.reconcile(runs,[]) if t['kind']=='browser_health' and t['status']!='resolved']
+    return todo['detail']
+
+
+def test_page_todo_lists_only_the_steps_actually_taken(tmp_path):
+    detail=_paused(tmp_path,{'attempts':2})
+    assert '已做：自动刷新 2 次、重新打开标签页 1 次；暂停后又自动检查 2 次' in detail and '从左侧菜单重新进入' not in detail
+
+
+@pytest.mark.parametrize('doc,expected',[({'result':'capped','cap':'incident','attempts':6},'已停止自动重试'),
+                                         ({'result':'precondition','reason':'当前环境与执行器尚未通过核验'},'页面恢复后也无法自动恢复'),
+                                         ({'page_stuck':False},'不会自动重试')])
+def test_page_todo_says_when_the_system_has_stopped_and_how_to_take_control(tmp_path,doc,expected):
+    detail=_paused(tmp_path,doc)
+    assert expected in detail and '手动恢复' in detail
+    if doc.get('reason'):assert doc['reason'] in detail   # 前置条件问题不用点浏览器
+    else:assert CONTROL in detail and 'View Only' in detail
+
+
+@pytest.mark.parametrize('attempts,expected',[(2,'系统会在下次检查时再试'),(6,'已停止自动重试')])
+def test_resume_failed_todo_says_whether_retries_continue(tmp_path,attempts,expected):
+    detail=_paused(tmp_path,{'result':'resume_failed','reason':'发布版本已变化','attempts':attempts})
+    assert expected in detail and '发布版本已变化' in detail
+
+
+def test_stuck_page_and_draft_todos_explain_how_to_take_control(tmp_path):
+    import time
+    db=Database(tmp_path);s=AttentionStore(db)
+    db.put('page_health','boss',{'id':'boss','at':time.time(),'healthy':False,'reason':'loading_stuck','exhausted':True,'kind':'chat','steps':['reload','reload','tab_reset','menu_entry']})
+    [todo]=[t for t in s.reconcile([],[]) if t['kind']=='browser_health']
+    assert CONTROL in todo['detail'] and '刷新 2 次' in todo['detail'] and '从左侧菜单重新进入 1 次' in todo['detail']
+    db.put('page_health','boss',{'id':'boss','at':time.time(),'healthy':False,'reason':'draft_present','needs_admin':True})
+    [todo]=[t for t in s.reconcile([],[]) if t['kind']=='browser_health' and t['status']!='resolved']
+    assert CONTROL in todo['detail']

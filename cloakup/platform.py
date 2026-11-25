@@ -199,6 +199,35 @@ def reusable_preflight(previous, signature, now):
     return reuse
 
 
+WARN_ONLY = {'boss_pages'}
+
+
+async def boss_pages(manager):
+    """环境检查“BOSS 页面可用”（11-24 20:40 沟通页卡在启动页）：用执行浏览器实际打开沟通页、推荐牛人页，不正常就自愈。
+    没有执行浏览器或不在任务执行时段时不打开网站，只说明原因。"""
+    from . import page_health
+    from .task_policy import window_status
+    live=manager.boss_session if manager.browser_alive(manager.boss_session) else None
+    if not live:return '执行浏览器未启动，未检查 BOSS 页面；任务运行时执行器每轮开始前会自动检查'
+    schedules=[]
+    for member in manager.account_execution.members():
+        if member.get('status') in ('stopped','completed'):continue
+        try:schedule=manager.db.get('task',member['id'])['config'].get('schedule')
+        except (FileNotFoundError,KeyError):schedule=None
+        if schedule:schedules.append(schedule)
+    if schedules and not any(window_status(s)['allowed'] for s in schedules):
+        return '当前不在任务执行时段，未打开 BOSS 页面；进入时段后执行器每轮开始前会自动检查'
+    lock=getattr(manager,'_browser_diagnostic_lock',None)
+    if lock is None:lock=manager._browser_diagnostic_lock=asyncio.Lock()
+    if lock.locked():raise ValueError('已有执行器诊断正在进行，请等待完成')
+    async with lock:
+        results=await page_health.check_pages(live)
+    detail=page_health.describe(results)
+    # 不正常时抛出，由 preflight 记为提醒（warning）：报告写明哪一页、卡在哪一步、做了什么，但不拦任务启动。
+    if not all(r.get('healthy') and not r.get('has_draft') for r in results) or len(results)<2:raise ValueError(detail)
+    return detail
+
+
 async def preflight(manager, report, *, reuse=None):
     reuse=reuse or {}
     async def check(key,title,fn,timeout=30):
@@ -222,11 +251,13 @@ async def preflight(manager, report, *, reuse=None):
                     'model':'模型网关未在规定时间内响应',
                     'harness':'Harness 合成请求未在规定时间内返回',
                     'browser':'浏览器启动、观察或隔离动作检查超时',
+                    'boss_pages':'BOSS 沟通页或推荐牛人页检查超时（含自动刷新、重开标签页、从菜单进入）',
                 }.get(key,title+'超时')
             else: hint=str(e) if isinstance(e,ValueError) else type(e).__name__
             for name in ('ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','CLOAKBROWSER_LICENSE_KEY','DATABASE_URL'):
                 if os.environ.get(name): hint=hint.replace(os.environ[name],'[已隐藏]')
-            item.update(status='failed',detail=hint[:300])
+            # BOSS 页面检查只提醒、不拦启动（复审决定）：不通过记为 warning，不影响整份报告是否通过。
+            item.update(status='warning' if key in WARN_ONLY else 'failed',detail=hint[:300])
         item.update(duration_ms=int((time.monotonic()-started)*1000),checked_at=time.time())
         manager.db.put('readiness',report['id'],report)
     async def db(): return await asyncio.to_thread(manager.db.probe)
@@ -300,9 +331,10 @@ async def preflight(manager, report, *, reuse=None):
         if result.get('status')!='passed':raise ValueError(result.get('reason','浏览器未就绪，执行器链路未核验'))
         return '隔离测试页通过定位、原生输入、原生点击、结果回读与单次执行核验；不代表目标网站业务已通过'
     try:
-        for key,title,fn,timeout in [('database','数据库事务',db,10),('storage','持久卷读写',disk,5),('model','模型网关响应',model,35),('harness','Harness运行时',harness,130),('browser','浏览器与观察能力',browser,150),('executor','执行器完整链路',executor,5)]:
+        for key,title,fn,timeout in [('database','数据库事务',db,10),('storage','持久卷读写',disk,5),('model','模型网关响应',model,35),('harness','Harness运行时',harness,130),('browser','浏览器与观察能力',browser,150),('executor','执行器完整链路',executor,5),('boss_pages','BOSS 页面可用',lambda:boss_pages(manager),300)]:
             await check(key,title,fn,300 if key=='browser' and report.get('run_id') else timeout)
-        report.update(status='passed' if all(c['status']=='passed' for c in report['checks']) else 'failed',finished_at=time.time())
+        report.update(status='passed' if all(c['status'] in ('passed','warning') for c in report['checks']) else 'failed',
+                      warnings=[c['key'] for c in report['checks'] if c['status']=='warning'],finished_at=time.time())
     except asyncio.CancelledError:
         report.update(status='interrupted',finished_at=time.time())
         raise

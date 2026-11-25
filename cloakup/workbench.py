@@ -694,8 +694,14 @@ class Workbench:
                 if cid in case_ids and record.get('updated_at',0)>=records.get(cid,{}).get('updated_at',-1):records[cid]=copy.deepcopy(record)
         owner.setdefault('selection_recovery',{}).update(records)
 
-    async def start_account_task(self, task_id, *, actor='admin', reason='start_or_resume'):
-        if self.preflight_task and not self.preflight_task.done():raise ValueError('环境与执行器核验进行中，请等待完成后启动任务')
+    def resume_blocker(self, task_id):
+        """启动／恢复该任务会被哪条前置检查拒绝（发布验收、环境核验、简历目标、岗位绑定、岗位冲突）；能启动时返回 None。
+        系统自动恢复前先查：这些问题刷新页面修不好，就不去碰页面。"""
+        try:Workbench._check_startable(self,task_id)
+        except Exception as exc:return str(exc) or type(exc).__name__  # 任何意外都当作“不能自动恢复”，交给管理员
+        return None
+
+    def _check_startable(self, task_id):
         definition=self.definitions.get(task_id);cfg=definition['config']
         from .agent_workspace import assert_release_ready
         assert_release_ready(self,task_id)
@@ -709,13 +715,18 @@ class Workbench:
         if cfg.get('sourcing_mode','continuous')=='quota' and received>=cfg.get('target_resumes',1):raise ValueError(f"任务已达到简历目标（已收到 {received} 位，目标 {cfg.get('target_resumes',1)} 位），请先调整目标人数后再启动")
         if any(not c.get('autonomy',{}).get('enabled') or not c['job'].get('snapshot') for c in selected):
             raise ValueError('请先绑定岗位并启用自动化')
-        current=self.busy()
-        if current and not current.get('account_runner'):raise ValueError('执行环境正被其他操作占用，请待当前操作完成')
         old=[m for m in self.account_execution.members() if m['id']!=task_id and m['status']!='stopped']
         if any(set(m['case_ids']) & set(ids) for m in old):raise ValueError('岗位已由另一个账号任务管理，请在原任务继续，避免重复调度')
         all_ids=list(dict.fromkeys([cid for m in old for cid in m['case_ids']]+ids))
         names=[self.cases.load(cid)['job']['label'] for cid in all_ids]
         if len(names)!=len(set(names)):raise ValueError('同名岗位不能可靠分流，请先区分名称')
+        return ids,all_ids
+
+    async def start_account_task(self, task_id, *, actor='admin', reason='start_or_resume'):
+        if self.preflight_task and not self.preflight_task.done():raise ValueError('环境与执行器核验进行中，请等待完成后启动任务')
+        ids,all_ids=Workbench._check_startable(self,task_id)
+        current=self.busy()
+        if current and not current.get('account_runner'):raise ValueError('执行环境正被其他操作占用，请待当前操作完成')
         if current:
             self.inherit_selection_recovery(current,all_ids)
             current['params']['new_contacts']=True;self.persist(current)

@@ -269,3 +269,23 @@ def test_job_exhausted_event_is_classified_and_reported(env):
     row = next(r for r in report['anomalies'] if r['category'] == 'outreach')
     assert row['outcomes'] == {'job_exhausted': 1} and row['fixability'] == 'auto' and row['pauses'] == 0
     assert '岗位推荐页暂无可联系的人' in dr.render_markdown(report)
+
+
+def test_paused_page_recovery_events_are_classified_and_reported(env):
+    # 11-24 20:40 沟通页卡在启动页：暂停期间自愈、系统自动恢复任务的事件归入“BOSS 页面打不开”
+    manager, case = env
+    from cloakup import autopilot  # noqa: F401  事件文字出自 autopilot.heal_paused_tasks
+    messages = {'沟通页仍打不开，任务保持暂停；执行时段内按间隔自动再试（最多 6 次），页面恢复且确认没有草稿后自动恢复任务': 'retry',
+                '沟通页暂停期间未自动检查：任务恢复会被拒绝（当前环境与执行器尚未通过核验），页面恢复后也无法自动恢复任务；请管理员处理后手动恢复': 'manual',
+                '沟通页自动恢复已停止自动重试：本次暂停已自动尝试 6 次仍未恢复；任务保持暂停，请管理员检查执行浏览器后手动恢复': 'stopped',
+                'BOSS 沟通页已恢复正常，系统已自动恢复任务；原会话先只读核验，未发送任何消息': 'auto_recovered',
+                '暂停期间检查沟通页：平台要求验证；处理前系统不自动恢复任务，请管理员在执行浏览器处理；处理后下次检查页面正常会自动恢复，也可手动恢复': 'manual',
+                '沟通页已恢复正常，但任务未能自动恢复（发布版本已失效）；系统会在下次检查时再试（已试 2/6 次），也可在任务页手动恢复': 'manual'}
+    for message, outcome in messages.items():
+        assert dr._classify({'message': message}) == ('page_health', outcome)
+    manager.db.append('r' * 32, {'at': at('16:00'), 'kind': 'step', 'message': next(iter(messages))})
+    manager.db.append('r' * 32, {'at': at('16:30'), 'kind': 'step', 'message': list(messages)[3]})
+    report = dr.build(manager.db, manager.cases.list(), DAY, tz=TZ, now=at('23:00') + 7200)
+    row = next(r for r in report['anomalies'] if r['category'] == 'page_health')
+    assert row['outcomes'] == {'retry': 1, 'auto_recovered': 1}
+    assert 'BOSS 页面打不开' in dr.render_markdown(report)

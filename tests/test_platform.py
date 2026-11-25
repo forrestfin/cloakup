@@ -133,8 +133,13 @@ def test_full_task_phases_snapshot_and_result(tmp_path,monkeypatch):
     finally:m.close()
 
 
-def test_preflight_real_checks_with_fake_components(tmp_path,monkeypatch):
+@pytest.mark.parametrize('pages',['skipped','failing'])
+def test_preflight_real_checks_with_fake_components(tmp_path,monkeypatch,pages):
     from cloakup.platform import preflight
+    if pages=='failing':
+        # 复审决定：BOSS 页面检查只提醒、不拦启动；不通过时报告仍为通过，executor_current 仍为真
+        async def stuck(manager):raise ValueError('沟通页不正常：内容没出来（停在启动页或空白）')
+        monkeypatch.setattr('cloakup.platform.boss_pages',stuck)
     monkeypatch.setenv('ANTHROPIC_API_KEY','test');monkeypatch.setenv('CLOAKBROWSER_LICENSE_KEY','test')
     m=Workbench(tmp_path)
     class Client:
@@ -158,8 +163,11 @@ def test_preflight_real_checks_with_fake_components(tmp_path,monkeypatch):
     report={'id':'c'*32,'status':'running','started_at':time.time(),'signature':environment_signature(),'checks':[]}
     try:
         m.call(preflight(m,report))
-        assert report['status']=='passed' and len(report['checks'])==6
-        assert m.latest_readiness()['fresh']
+        assert report['status']=='passed' and len(report['checks'])==7
+        item=next(c for c in report['checks'] if c['key']=='boss_pages')
+        if pages=='skipped':assert item['status']=='passed' and '未检查' in item['detail']   # 没有执行浏览器时不打开 BOSS 页面
+        else:assert item['status']=='warning' and '沟通页不正常' in item['detail'] and report.get('warnings')==['boss_pages']
+        assert m.latest_readiness()['fresh'] and m.latest_readiness()['executor_current']
         monkeypatch.setenv('CLOAKUP_MODEL','changed')
         assert not m.latest_readiness()['fresh']
     finally:m.close()
@@ -226,13 +234,39 @@ def test_preflight_reuses_one_seat_without_touching_business_page(tmp_path,monke
         def __init__(self,*a):pass
         async def json(self,**kw):return {'ready':True}
     monkeypatch.setattr('cloakup.harness_runtime.HarnessPlanner',Harness)
+    pages=[]
+    async def check_pages(session):
+        assert session is live and live.page is original  # 合成测试页已关、业务页已还原后才检查 BOSS 页面
+        pages.append(True);return [{'kind':'chat','healthy':True,'needs_admin':False,'has_draft':False},{'kind':'recommend','healthy':True,'needs_admin':False,'has_draft':False}]
+    monkeypatch.setattr('cloakup.page_health.check_pages',check_pages)
     report={'id':'d'*32,'status':'running','started_at':time.time(),'signature':environment_signature(),'checks':[]}
     try:
         m.call(preflight(m,report))
-        assert report['status']=='passed'
+        assert report['status']=='passed' and pages==[True]
         assert live.page is original and live.last_obs=='previous observation'
         assert live._observed_frames=={'one':'frame'}
         assert not started and closed==['tab']
+    finally:m.boss_session=None;m.close()
+
+
+@pytest.mark.parametrize('schedule,expected',[(None,'failed'),('closed','passed')])
+def test_preflight_reports_where_a_boss_page_is_stuck(tmp_path,monkeypatch,schedule,expected):
+    # 11-24 20:40 沟通页卡在启动页：环境检查写明哪一页、卡在哪一步、做了什么；时段外不打开 BOSS 页面
+    from cloakup import platform
+    m=Workbench(tmp_path)
+    live=SimpleNamespace(page=SimpleNamespace(is_closed=lambda:False,url='https://www.zhipin.com/web/chat/index'),context=SimpleNamespace(pages=[]))
+    m.boss_session=live
+    if schedule:
+        m.account_execution.set_task('task',['case'],'paused')
+        m.db.put('task','task',{'id':'task','config':{'schedule':{'enabled':True,'timezone':'Asia/Shanghai','weekdays':[],'windows':[{'start':'09:00','end':'12:00'}]}}})
+    async def check_pages(session):
+        return [{'kind':'chat','healthy':False,'reason':'menu_missing','cause':'content_missing','exhausted':True,'needs_admin':False,'has_draft':False,'steps':['reload','reload','tab_reset','menu_entry']}]
+    monkeypatch.setattr('cloakup.page_health.check_pages',check_pages)
+    try:
+        if expected=='failed':
+            with pytest.raises(ValueError) as caught:m.call(platform.boss_pages(m))
+            assert '沟通页不正常' in str(caught.value) and '菜单' in str(caught.value)
+        else:assert '执行时段' in m.call(platform.boss_pages(m))
     finally:m.boss_session=None;m.close()
 
 
