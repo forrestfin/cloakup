@@ -538,3 +538,16 @@ def test_stuck_page_and_draft_todos_explain_how_to_take_control(tmp_path):
     db.put('page_health','boss',{'id':'boss','at':time.time(),'healthy':False,'reason':'draft_present','needs_admin':True})
     [todo]=[t for t in s.reconcile([],[]) if t['kind']=='browser_health' and t['status']!='resolved']
     assert CONTROL in todo['detail']
+
+
+def test_question_todo_names_the_question_before_a_resume_card(tmp_path,monkeypatch):
+ # 11-26 17:36 qe工程师 伍礼鹏：问“还有其他职位吗”后发了附件简历；语义层针对问题转人工，
+ # 待办却取了最后一条（简历卡片“伍礼鹏-个人简历.pdf / 点击预览附件简历”）。
+ from cloakup import conversation_semantics as cs
+ monkeypatch.setattr(cs,'current',lambda case,person:{'answer':{'action':'defer'}})
+ store=AttentionStore(Database(tmp_path))
+ inbox=[{'external_id':'q','text':'还有其他职位吗'},{'external_id':'perm','text':'对方想发送附件简历给您，您是否同意\n\n拒绝\n同意','platform_control':True},
+        {'external_id':'card','text':'某某-个人简历.pdf\n点击预览附件简历','resume':True}]
+ c={'id':'c','job':{'label':'岗位'},'candidates':{'p':{'id':'p','status':'resume_received','inbox':inbox,'outbox':[],'resumes':[{'id':'r'}]}}}
+ todos=[t for t in store.reconcile([], [c]) if t['kind']=='question']
+ assert [(t['question'],t['reply_id']) for t in todos]==[('还有其他职位吗','q')]

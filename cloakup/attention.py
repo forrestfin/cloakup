@@ -295,12 +295,16 @@ class AttentionStore:
                 if is_privacy_hold(c.get('decision_hold')) and c.get('status') not in ('closed','do_not_contact'):
                     add('privacy_hold:'+case['id']+':'+c['id'],'decision','对话需要隐私复核后人工接续',
                         '这段对话里有系统无法可靠隐去的身份或机构信息，按隐私规则没有发给模型，候选人的来信暂时不会自动回复（收到简历的致谢仍会照常发送）。请在沟通记录中查看，由顾问在平台上回复；对话有新消息后系统会自动重新检查，恢复正常后此待办自动解除。',**refs)
+                # 11-26 17:36 伍礼鹏：问题后面跟着简历卡片时，语义判断针对的是卡片前的问题（与回复用同一个 reply_target），不是最后一条。
+                from .decision_runtime import reply_target,_resume_card
+                target=reply_target(c)
                 for last in incoming:
                     # 已对这条问题发出实质回答并确认送达：管理员补充的答案已经给到候选人，待办完成。
                     if answered(c,last['external_id']):continue
+                    if _resume_card(last):continue
                     from .conversation_semantics import current as semantic_current
                     semantic=semantic_current(case,c)
-                    if semantic and (last['external_id']!=incoming[-1]['external_id'] or semantic['answer']['action']!='defer'):continue
+                    if semantic and (not target or last['external_id']!=target.get('external_id') or semantic['answer']['action']!='defer'):continue
                     # 知识库答不上就立刻生成待办，不等模型分类，也不等浏览器把会话点开。
                     from .boss_resume import is_permission_text
                     text=last.get('text','').strip()
