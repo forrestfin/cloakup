@@ -224,7 +224,7 @@ def _held_minutes(events, category, release_markers, end, now):
     return _minutes(total)
 
 
-def _outcomes(cases, start, end):
+def outcomes(cases, start, end):
     """按岗位统计当天结果，以及来信到我方下一条消息的响应时长。"""
     per_job = []
     latencies = []
@@ -273,6 +273,9 @@ def _outcomes(cases, start, end):
                    'p90_minutes': _minutes(ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]),
                    'max_minutes': _minutes(ordered[-1])}
     return per_job, summary, unanswered
+
+
+_outcomes = outcomes
 
 
 CONVERSATION_ISSUES = {
@@ -501,7 +504,7 @@ def build(db, cases, day: date, *, tz=None, now=None):
     events = _events(db, start, end)
     window_minutes, spans = _window_minutes(db, day, tz)
     pauses = _pauses(db, start, end, events, now)
-    per_job, latency, unanswered = _outcomes(cases, start, end)
+    per_job, latency, unanswered = outcomes(cases, start, end)
     audit_counts = _audit_anomalies(cases, start, end)
     notifications = _notifications(db, start, end)
     anomalies = _anomaly_table(events, audit_counts, notifications, pauses, end)

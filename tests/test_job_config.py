@@ -2,7 +2,7 @@ import copy
 from types import SimpleNamespace as NS
 import pytest
 from cloakup.sourcing import CaseStore,SourcingError
-from cloakup.job_config import view_config,save_config
+from cloakup.job_config import view_config,save_config,locked_task,locked_tasks
 from cloakup.autonomy import local_brief
 from cloakup import autopilot as ap
 
@@ -92,3 +92,27 @@ def test_fact_anchors_are_job_agnostic(requirements,kinds):
  found={}
  for f in facts_for({'anonymous_job':{'role':'岗位','requirements':requirements}}):found.setdefault(f['anonymous_index'],set()).add(f['kind'])
  assert found==kinds
+
+def test_locked_task_matches_save_config(data):
+ # 11-25 岗位页与任务「岗位与事实」两处可改：锁定条件须与 save_config 拒绝保存的条件一致
+ s,c=data;assert locked_task(s.db,c['id']) is None
+ save_config(s,c,body(c))
+ s.db.put('task','t1',{'id':'t1','config':{'name':'多岗位寻访','engine':'boss_sourcing','case_ids':[c['id']]}})
+ assert locked_task(s.db,c['id']) is None
+ save_config(s,c,body(c))
+ s.db.put('agent_release','t1',{'id':'t1','version_id':'v1'})
+ assert locked_task(s.db,c['id'])=={'id':'t1','name':'多岗位寻访'}
+ with pytest.raises(SourcingError,match='^该岗位已纳入验证后发布，请在关联任务的岗位资料与寻访配置中修改并验证，不能直接覆盖生效事实$'):save_config(s,c,body(c))
+
+def test_locked_tasks_batch_matches_locked_task(data):
+ # 11-25 状态轮询批量算锁定：结果须与逐个 locked_task 一致（无发布／已锁定／未锁定）
+ s,c=data;c2=s.create('https://www.zhipin.com/web/chat/job/edit?encryptId=j2');s.bind_job(c2,{'title':'另一岗位','requirements':'经验'})
+ ids=[c['id'],c2['id']]
+ s.db.put('task','t1',{'id':'t1','config':{'name':'多岗位寻访','engine':'boss_sourcing','case_ids':[c['id']]}})
+ assert locked_tasks(s.db,ids)=={cid:locked_task(s.db,cid) for cid in ids}=={c['id']:None,c2['id']:None}
+ s.db.put('agent_release','t1',{'id':'t1','version_id':'v1'})
+ assert locked_tasks(s.db,ids)=={cid:locked_task(s.db,cid) for cid in ids}=={c['id']:{'id':'t1','name':'多岗位寻访'},c2['id']:None}
+ reads=[];real=s.db.list
+ s.db.list=lambda kind:(reads.append(kind),real(kind))[1]
+ locked_tasks(s.db,ids);assert sorted(reads)==['account_task','agent_release','task']
+ s.db.list=real

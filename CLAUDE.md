@@ -19,6 +19,7 @@
 - `cloakup/attention.py`：管理员待办（由真实状态推导，`reconcile`）；`agent_workspace.py`：草案、隔离验收、发布与签名
 - `cloakup/workbench.py`：HTTP 服务、任务管理、重启恢复；`boss_*.py`：BOSS 页面适配；`logbook.py`：结构化日志
 - `tests/test_<模块>.py`：与模块一一对应
+- 菜单 → 页面 → 代码对照：docs/workbench-map.md
 
 ## 不能破坏的约束（测试都有覆盖）
 1. **先核验再发送**：发送前核实当前会话收件人与岗位；核不实就只放下这一条。

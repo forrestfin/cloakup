@@ -58,10 +58,11 @@ def normalize_config(db,cfg):
  return cfg
 
 
-def effective_task(db,cid):
+def effective_task(db,cid,tasks=None,account_tasks=None):
+ """tasks/account_tasks 可传入已读的整表，批量计算时避免逐岗位重读。"""
  from .scenarios import is_sourcing
- tasks=[t for t in db.list('task') if is_sourcing(t['config'].get('engine')) and cid in t['config'].get('case_ids',[])]
- members={m['id']:m for m in db.list('account_task') if m['status']!='stopped' and cid in m['case_ids']}
+ tasks=[t for t in (db.list('task') if tasks is None else tasks) if is_sourcing(t['config'].get('engine')) and cid in t['config'].get('case_ids',[])]
+ members={m['id']:m for m in (db.list('account_task') if account_tasks is None else account_tasks) if m['status']!='stopped' and cid in m['case_ids']}
  tasks.sort(key=lambda t:(t['id'] in members,members.get(t['id'],{}).get('status')=='running',t.get('updated_at',0)),reverse=True)
  return tasks[0] if tasks else None
 

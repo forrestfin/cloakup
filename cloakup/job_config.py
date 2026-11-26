@@ -38,10 +38,25 @@ def view_config(case):
          'filters':list(case.get('recommend_filters',[])),'execution':execution}
 
 
-def save_config(store,case,body):
+def locked_task(db,case_id,releases=None,tasks=None,account_tasks=None):
+ """已纳入有发布版本的任务时返回该任务（岗位只能在任务里改）；releases（发布 id 集合）、tasks、account_tasks 可传入已读的整表，避免逐岗位重复读取。"""
+ releases={r['id'] for r in db.list('agent_release')} if releases is None else releases
+ if not releases:return None
  from .task_policy import effective_task
- task=effective_task(store.db,case['id'])
- if task and any(r['id']==task['id'] for r in store.db.list('agent_release')):
+ task=effective_task(db,case_id,tasks,account_tasks)
+ return {'id':task['id'],'name':task['config'].get('name')} if task and task['id'] in releases else None
+
+
+def locked_tasks(db,case_ids):
+ """状态轮询用：发布、任务、账号任务三张表各只读一次，逐岗位给出 locked_task 的结果。"""
+ releases={r['id'] for r in db.list('agent_release')}
+ if not releases:return {cid:None for cid in case_ids}
+ tasks,account_tasks=db.list('task'),db.list('account_task')
+ return {cid:locked_task(db,cid,releases,tasks,account_tasks) for cid in case_ids}
+
+
+def save_config(store,case,body):
+ if locked_task(store.db,case['id']):
   raise SourcingError('该岗位已纳入验证后发布，请在关联任务的岗位资料与寻访配置中修改并验证，不能直接覆盖生效事实')
  if set(body)!={'expected_revision','config'}:raise SourcingError('配置请求字段不合法')
  if type(body['expected_revision']) is not int or body['expected_revision']!=case.get('config_revision',0):

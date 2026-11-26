@@ -399,6 +399,17 @@ def test_snapshot_carries_job_overview_for_sourcing_tasks(manager, monkeypatch):
     assert manager.call(scenario())[task['id']]=={'jobs':[],'changes':[],'error':'岗位视图暂时无法读取：boom'}
 
 
+def test_snapshot_includes_today(manager, monkeypatch):
+    # 11-25 Task 2：首页“今天”随状态下发；today.build 出错只给兜底文字，不把整个工作台拖垮
+    async def scenario():return await manager.snapshot()
+    state=manager.call(scenario())
+    assert 'today' in state and state['today']['tasks']==[]
+    from cloakup import today
+    monkeypatch.setattr(today,'build',lambda *a,**k:(_ for _ in ()).throw(RuntimeError('boom')))
+    state=manager.call(scenario())
+    assert state['today']=={'error':'今天的数据暂时算不出来'} and 'attention' in state
+
+
 def test_restart_settles_job_adds_whose_validation_was_interrupted(manager):
     # 11-24 复审：重启时隔离验收被标为中断，排队中的加入请求随之结算为失败（生成待办、可重新加入），不再停在“验收中”
     manager.db.put('agent_test','a'*32,{'id':'a'*32,'task_id':'b'*32,'status':'running','mode':'validate','bundle':{},'fixtures':[]})
@@ -501,3 +512,18 @@ async def test_finished_errand_run_starts_a_follow_up_for_late_requests(manager,
     jid = (await manager.create({'mode': 'boss_errand', 'params': {}}))['id']
     await manager.tasks[jid]
     assert calls == [jid]
+
+
+def test_snapshot_reads_lock_tables_once(manager, monkeypatch):
+    # 11-25 岗位锁定随 /api/state 轮询下发：每次快照只批量算一次（两处 cases 共用），结果与逐个 locked_task 一致
+    cases=[manager.cases.create(f'https://www.zhipin.com/web/chat/job/edit?encryptId=j{i}') for i in range(3)]
+    task=manager.definitions.save({'config':{'name':'寻访任务','website':'https://www.zhipin.com/','scenario':'寻访','goal':'持续取得简历','engine':'boss_sourcing','case_ids':[cases[0]['id']]}})
+    manager.db.put('agent_release',task['id'],{'id':task['id'],'version_id':'v1'})
+    from cloakup import job_config
+    locks={c['id']:job_config.locked_task(manager.db,c['id']) for c in cases}
+    calls=[]
+    real_batch=job_config.locked_tasks
+    monkeypatch.setattr(web,'locked_tasks',lambda db,ids:(calls.append(list(ids)),real_batch(db,ids))[1])
+    snap=manager.call(manager.snapshot())
+    assert len(calls)==1 and {c['id']:c['config_locked_by'] for c in snap['cases']}==locks
+    assert locks[cases[0]['id']]=={'id':task['id'],'name':'寻访任务'} and locks[cases[1]['id']] is None

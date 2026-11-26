@@ -19,20 +19,23 @@
     <aside class="sidebar">
       <nav aria-label="主导航">
         <div class="nav-group"><div class="nav-caption">工作空间</div>
-          <button class="nav-item" data-nav="operations" data-icon="briefcase">工作台</button>
-          <button class="nav-item" data-nav="tasks" data-icon="play">自动化任务</button>
-          <button class="nav-item" data-nav="attention" data-icon="check">待办中心 <span id="todo-count"></span></button>
-        </div>
-        <div class="nav-group"><div class="nav-caption">场景与 Agent</div>
-          <button class="nav-item" data-nav="templates" data-icon="briefcase">场景模板</button>
-          <button class="nav-item" data-nav="planner" data-icon="messages">规划端</button>
-          <button class="nav-item" data-nav="executor" data-icon="history">执行端</button>
+          <button class="nav-item" data-nav="operations" data-icon="briefcase">今天</button>
+          <button class="nav-item" data-nav="tasks" data-icon="play">任务</button>
+          <button class="nav-item" data-nav="attention" data-icon="check">待办 <span id="todo-count"></span></button>
+          <button class="nav-item" data-nav="sourcing" data-icon="search">岗位</button>
         </div>
         <div class="nav-group"><div class="nav-caption">平台管理</div>
           <button class="nav-item" data-nav="environments" data-icon="link">执行环境</button>
         </div>
       </nav>
-      <div class="sidebar-bottom"><button class="nav-item" data-nav="settings" data-icon="settings">系统设置</button><div class="local-context"><span class="status-dot"></span>本机工作空间</div></div>
+      <div class="sidebar-bottom"><button class="nav-item" data-nav="settings" data-icon="settings">系统设置</button>
+        <div class="nav-group nav-advanced"><button class="nav-toggle" type="button" data-nav-advanced aria-expanded="false" aria-controls="nav-advanced-items">高级</button>
+          <div class="nav-advanced-items" id="nav-advanced-items" hidden>
+            <button class="nav-item" data-nav="templates" data-icon="briefcase">场景模板</button>
+            <button class="nav-item" data-nav="planner" data-icon="messages">规划端</button>
+            <button class="nav-item" data-nav="executor" data-icon="history">执行端</button>
+          </div>
+        </div><div class="local-context"><span class="status-dot"></span>本机工作空间</div></div>
     </aside>
     <main id="content" aria-label="工作区"><div class="loading">正在加载工作台</div></main>
   </div>

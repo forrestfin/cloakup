@@ -145,3 +145,29 @@ async def test_settings_wait_for_the_job_tab_before_giving_up(monkeypatch):
  monkeypatch.setattr(fa,'text_control',text_control);monkeypatch.setattr(fa,'click',click)
  session=NS(page=NS(url=gp.GREETING_URL,frames=[NS(url='https://www.zhipin.com'+gp.GREETING_FRAME)]))
  assert (await gp.read_settings(session))['rows']==rows and clicked==['#tab']
+
+
+def _dialog_session(monkeypatch,selected):
+ from cloakup import frame_actions
+ monkeypatch.setattr(frame_actions,'click',AsyncMock())
+ loc=NS(count=AsyncMock(return_value=1),click=AsyncMock());session=NS(page=NS(frames=[NS(url=gp.GREETING_FRAME,locator=lambda _:loc)]),type_text=AsyncMock())
+ async def act(kind,fn):return await fn()
+ session._act=act
+ monkeypatch.setattr(gp,'_frame_value',AsyncMock(side_effect=[selected,False]));monkeypatch.setattr(gp,'_find',AsyncMock(return_value=(NS(index=1,raw={'value':'新话术'}),None)))
+ click=AsyncMock();monkeypatch.setattr(gp,'_click',click)
+ return session,click
+
+
+async def test_dialog_label_with_city_after_the_title_still_counts_as_this_job(monkeypatch):
+ # 11-25 18:24 FDE交付工程师：平台上还没有本岗位话术，新增窗口里选中的岗位文字带城市、薪资，与岗位名全等比较失败；未输入、未保存。
+ session,click=_dialog_session(monkeypatch,['招聘顾问\n武汉 15-25K'])
+ await gp.synchronize(session,'招聘顾问','新话术',snapshot('旧'),AsyncMock(),lambda:None)
+ assert session.type_text.await_count==1 and click.await_args.args[1]=='保存'
+
+
+@pytest.mark.parametrize('selected',[['招聘顾问助理'],['招聘顾问 武汉','运营专员 杭州'],[]])
+async def test_dialog_job_check_still_rejects_other_or_ambiguous_jobs_and_says_what_it_saw(monkeypatch,selected):
+ session,click=_dialog_session(monkeypatch,selected)
+ with pytest.raises(gp.GreetingUnavailable) as err:await gp.synchronize(session,'招聘顾问','新话术',snapshot('旧'),AsyncMock(),lambda:None)
+ session.type_text.assert_not_awaited();click.assert_not_awaited()
+ assert '编辑窗口未唯一核实当前岗位' in str(err.value) and ('选中 %d 个' % len(selected)) in str(err.value)

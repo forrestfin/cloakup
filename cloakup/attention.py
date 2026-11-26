@@ -26,6 +26,10 @@ ISOLATED_TODO_SECONDS = 24 * 3600
 JOB_CHANGE_STUCK_SECONDS = 30 * 60
 OUTREACH_BLOCKED_DEFERRALS = 3
 
+def order(t):
+    """待办排序：未解决在前，登录／验证等优先，同类按创建时间新到旧（待办中心与首页共用）。"""
+    return (t['status']=='resolved',{'login':0,'verification':0,'delivery':0,'capacity':1,'execution':1,'execution_recovery':1,'question':2,'handoff':3}.get(t['kind'],4),-t['created_at'])
+
 class AttentionStore:
     def __init__(self,db):self.db=db
     def reconcile(self,runs,cases):
@@ -329,7 +333,7 @@ class AttentionStore:
                 if retired_delivery:old.update(note=note,retired_reason='routine_delivery_observation')
                 old['history'].append({'at':now,'action':'source_cleared',**({'note':note} if note else {})})
                 self.db.put('attention',ident,old)
-        return sorted(self.db.list('attention'),key=lambda t:(t['status']=='resolved',{'login':0,'verification':0,'delivery':0,'capacity':1,'execution':1,'execution_recovery':1,'question':2,'handoff':3}.get(t['kind'],4),-t['created_at']))
+        return sorted(self.db.list('attention'),key=order)
 
     def update(self,ident,body):
         todo=self.db.get('attention',ident)

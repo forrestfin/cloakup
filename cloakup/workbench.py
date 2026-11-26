@@ -41,7 +41,7 @@ from .boss import read_job, prepare_plan, validate_job_url
 from .boss_contact import run_first_contact, valid_message
 from .boss_recommend import open_list as read_recommendations, run_recommend_review
 from .autopilot import run_autopilot
-from .job_config import view_config, save_config
+from .job_config import view_config, save_config, locked_tasks
 from .facts import draft_anonymous_job
 from .access import is_boss_url, boss_login_required, boss_verification_required, boss_access_ready, can_recover_login
 from .attention import AttentionStore, sourcing_overview
@@ -559,17 +559,26 @@ class Workbench:
         from importlib.metadata import version,PackageNotFoundError
         try:harness_version=version('deepseek-harness-sdk')
         except PackageNotFoundError:harness_version=None
-        cases=[{**c,"editable_config":view_config(c)} for c in self.cases.list()]
+        cases=self.cases.list();locks=locked_tasks(self.db,[c['id'] for c in cases])
+        cases=[{**c,"editable_config":view_config(c),"config_locked_by":locks.get(c['id'])} for c in cases]
         todos=self.attention.reconcile(list(self.jobs.values()),cases)
         executor_signature=environment_signature();browser_instance=getattr(self.boss_session,'instance_id',None) if self.browser_alive(self.boss_session) else None
         executor_checks=[{**r,'current':bool(browser_instance and r.get('browser_instance_id')==browser_instance and r.get('signature')==executor_signature)} for r in self.db.list('executor_check')[:20]]
         ready = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
-        return copy.deepcopy({"greeting_readiness":self.db.list("greeting_readiness"),"scenario_workspace":self.scenario_workspace.catalog(),"agent_workspace":self.agent_workspace.catalog(),"notifications":__import__("cloakup.task_notifications",fromlist=["status"]).status(self),"prompt_defaults":prompt_defaults(),"planning_runtime":{"name":"DeepSeek Harness","version":harness_version,"enabled":bool(harness_version),"profile":"sdk-minimal","scope":"全场景任务规划与持续决策","tools":"disabled"},"planning_dialogues":self.db.list("planning_dialogue"),"planning_requests":self.db.list("planning_request"),"execution_metrics":self.execution_metrics(cases),"followup_policy":self.followup_policy(),"actions":ActionLedger(self.db).list(),"task_plans":self.task_plan_records(),"answer_policy":{"version":ANSWER_POLICY_VERSION,"order":ANSWER_ORDER},"browser_capacity":self.capacity_status(),"account_execution":self.account_execution.view(next((r for r in self.jobs.values() if r.get("account_runner") and r["status"] in ACTIVE),None),self.browser_alive(self.boss_session)),"runtime_status":self.runtime_status(),"attention":todos,"sourcing_overview":sourcing_overview(cases,list(self.jobs.values())),"job_overview":self.job_overview(cases),"token": self.token, "model": default_model(), "model_ready": ready,
+        return copy.deepcopy({"greeting_readiness":self.db.list("greeting_readiness"),"scenario_workspace":self.scenario_workspace.catalog(),"agent_workspace":self.agent_workspace.catalog(),"notifications":__import__("cloakup.task_notifications",fromlist=["status"]).status(self),"prompt_defaults":prompt_defaults(),"planning_runtime":{"name":"DeepSeek Harness","version":harness_version,"enabled":bool(harness_version),"profile":"sdk-minimal","scope":"全场景任务规划与持续决策","tools":"disabled"},"planning_dialogues":self.db.list("planning_dialogue"),"planning_requests":self.db.list("planning_request"),"execution_metrics":self.execution_metrics(cases),"followup_policy":self.followup_policy(),"actions":ActionLedger(self.db).list(),"task_plans":self.task_plan_records(),"answer_policy":{"version":ANSWER_POLICY_VERSION,"order":ANSWER_ORDER},"browser_capacity":self.capacity_status(),"account_execution":self.account_execution.view(next((r for r in self.jobs.values() if r.get("account_runner") and r["status"] in ACTIVE),None),self.browser_alive(self.boss_session)),"runtime_status":self.runtime_status(),"attention":todos,"sourcing_overview":sourcing_overview(cases,list(self.jobs.values())),"job_overview":self.job_overview(cases),"today":self.today_view(cases),"token": self.token, "model": default_model(), "model_ready": ready,
             "ui_version": str((ASSETS / "app.js").stat().st_mtime_ns),
             "definitions": self.definitions.list(), "readiness": self.latest_readiness(), "executor_checks": executor_checks, "database": self.db.backend, "runtime": "docker" if Path("/.dockerenv").exists() else "local",
             "capabilities": {"boss_first_contact": True, "boss_recommend": True, "boss_autopilot": True},
-            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c)} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
+            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c),"config_locked_by":locks.get(c['id'])} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
             "busy": self.busy()["id"] if self.busy() else None})
+
+    def today_view(self,cases):
+        """首页“今天”的只读视图；cases 须是完整、未过滤的岗位列表（账号已用额度由它算）。算不出来只给兜底文字，不拖垮整个状态。"""
+        from . import today
+        try:return today.build(self.db,self.cases,cases,self.account_execution.members(),self.account_execution.availability)
+        except Exception:
+            logging.getLogger('cloakup.web').exception('today view failed')
+            return {'error':'今天的数据暂时算不出来'}
 
     def job_overview(self,cases):
         """寻访任务岗位区的只读视图；单个任务算不出来只给该任务带上原因，不影响整个状态。"""

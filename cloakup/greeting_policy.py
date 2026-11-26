@@ -78,7 +78,11 @@ async def synchronize(session,title,text,before,guard,before_save):
   await frame_click(session,frame,row['edit_path'])
  # Verify the opened editor still belongs to this one job before typing.
  selected=await _frame_value(session,GREETING_FRAME,"Array.from(document.querySelectorAll('.dialog-wrap .radio-group label')).filter(e=>e.querySelector('input[type=radio]')?.checked).map(e=>e.innerText.trim())")
- if len(selected)!=1 or selected[0]!=title:raise GreetingUnavailable('编辑窗口未唯一核实当前岗位；未输入、未保存')
+ # 11-25 18:24 FDE交付工程师：新增窗口里岗位文字可能带城市、薪资（“岗位名 + 分隔 + 其他”），全等比较必失败。
+ # 只认“等于岗位名，或岗位名后紧跟空白／分隔符”，并把看到的选中项写进原因，下次失败可直接对照。
+ labels=[str(v).strip() for v in selected or []]
+ same=lambda v:v==title or (v.startswith(title) and v[len(title)] in ' \t\n　·|/-_,，(（')
+ if len(labels)!=1 or not same(labels[0]):raise GreetingUnavailable('编辑窗口未唯一核实当前岗位（选中 %d 个：%s）；未输入、未保存'%(len(labels),'、'.join(v.replace('\n',' ')[:40] for v in labels[:3]) or '无'))
  await guard();el,_=await _find(session,'请输入打招呼语',tag='textarea',frame=GREETING_FRAME)
  await session.type_text(el.index,text,clear=True,submit=False)
  el,_=await _find(session,'请输入打招呼语',tag='textarea',frame=GREETING_FRAME)
