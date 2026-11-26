@@ -330,6 +330,16 @@ async def test_direct_run_leaves_late_requests_to_a_follow_up_run(env):
     assert env.state['created']==[{'mode':'boss_errand','params':{}}]
 
 
+async def test_run_that_never_reached_the_queue_does_not_start_another(env):
+    # 11-26 09:33 现场：CloakBrowser 授权未通过，浏览器起不来，run_direct 没跑到、没有快照；
+    # after_run 把所有排队代办都当成“新登记”，每 35 秒再起一次，一直重试授权。起不来的运行不续跑。
+    await _read(env);env.state['busy']=None
+    await be.request_refresh(env.m)
+    job={'id':'r'*32,'mode':'boss_errand','status':'failed'};env.state['created'].clear()
+    await be.after_run(env.m,job)
+    assert env.state['created']==[]
+
+
 async def test_direct_path_respects_the_execution_window(env):
     # 11-25 审阅：没有执行器时也只在执行时段内操作网站。
     for t in (env.task,env.task2):

@@ -712,12 +712,10 @@ async def first_contact(manager,job,session,case):
         if any(m['status'] in ('draft','approved') for m in c['outbox']):
             store._invalidate(c)
             store.audit(case,'draft_superseded',candidate_id=cid,reason='新的只读核对替换尚未发送的旧草稿')
-        # Stable reviewed per-job text; no automatic account setting changes.
-        text=case.get('desired_greeting',case.get('platform_greeting_text'))
-        if text!=case.get('platform_greeting_text'):
-            # A configuration changed after verification; never use the old proof.
-            return 'blocked'
-        if not text:raise SourcingError('尚无已核实的岗位首聊话术')
+        # 11-26 管理员决定“照写不拦”：首聊记录用本任务的问候语；BOSS 实际发出的是该岗位现有招呼语（写入成功时二者一致）。
+        from .greeting_policy import render as render_greeting
+        text=render_greeting(case['desired_greeting'],case) if case.get('desired_greeting') else case.get('platform_greeting_text')
+        if not text:raise SourcingError('任务尚未配置首聊话术')
         from .decision_runtime import initial_contact_decision
         harness_id=await initial_contact_decision(manager,job,case,c)
         # False：仅跳过这一位（模型选择暂不联系）；None：全局条件不满足，结束本批。
@@ -752,7 +750,7 @@ async def first_contact(manager,job,session,case):
         decision={'reason':'普通推荐卡片；仅依据本岗位要求与职业关键词相关的职业记录发起了解，不作录用决定',
                   'card_sha256':card_fingerprint(card),'job_revision':case['job']['revision'],'harness_decision_id':harness_id}
         store.authorize_automation(case,cid,message['id'],decision=decision)
-        adapter=BossRecommendContact(session)
+        adapter=BossRecommendContact(session,require_greeting_proof=False)
         try:
             proof=await adapter.prepare(case,c,message)
             await adapter.configure(case['job']['label'],text)

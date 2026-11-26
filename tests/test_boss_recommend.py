@@ -299,3 +299,34 @@ async def test_switch_without_recommend_frame_defers(switch_world):
     s=SwitchSession();s.page.frames=[]
     with pytest.raises(SourcingError,match='推荐页面尚未加载'):await br.switch_job(s,'job-BBBBBB','岗位乙')
     assert s.clicks==[]
+
+
+async def test_open_list_goes_on_when_the_platform_greeting_cannot_be_reread(monkeypatch):
+    # 11-26 管理员决定“照写不拦”：复核 BOSS 岗位话术失败不再挡住推荐页。
+    from cloakup import page_health
+    async def heal(session,kind):return {'healthy':True}
+    async def navigate(url):pass
+    async def noop(*a,**kw):pass
+    async def cards(session):return []
+    async def unreadable(*a):raise br.GreetingVerificationError('未找到唯一的本岗位已保存话术；本次不会覆盖或开聊')
+    monkeypatch.setattr(page_health,'heal',heal);monkeypatch.setattr(br,'_click',noop);monkeypatch.setattr(br,'switch_job',noop)
+    monkeypatch.setattr(br,'verify_list',noop);monkeypatch.setattr(br,'read_cards',cards);monkeypatch.setattr(br,'existing_greeting',unreadable)
+    monkeypatch.setattr(br,'job_identity',lambda c:'job-1')
+    session=NS(max_elements=0,navigate=navigate,page=None,_boss_greeting=None)
+    case={'job':{'label':'岗位甲','url':'https://www.zhipin.com/job_detail/x.html?encryptId=job-1'},'recommend_filters':[],'platform_greeting_text':'旧话术'}
+    assert await br.open_list(session,case)==[] and session._boss_greeting is None
+
+
+async def test_automatic_contact_does_not_require_a_greeting_proof(monkeypatch):
+    # 11-26：自动首聊不再要求岗位话术核对凭证；BOSS 发出的是该岗位现有招呼语。人工审阅开聊仍要求凭证。
+    card={'geek_id':'g-1','platform_label':'隐名','summary':'经历'}
+    async def profile(*a,**kw):return card
+    monkeypatch.setattr(br,'open_profile',profile)
+    case={'job':{'url':'https://www.zhipin.com/web/chat/job/edit?encryptId=job-1','label':'交付顾问'}}
+    candidate={'profile':{'geek_id':'g-1','review_card_sha256':br.card_fingerprint(card)}}
+    strict=br.BossRecommendContact(NS(_boss_greeting=None))
+    with pytest.raises(SourcingError):await strict.prepare(case,candidate,{'text':'任务问候语'})
+    adapter=br.BossRecommendContact(NS(_boss_greeting=None),require_greeting_proof=False)
+    proof=await adapter.prepare(case,candidate,{'text':'任务问候语'})
+    assert proof['geek_id']=='g-1' and proof['greeting_action']=='platform'
+    assert await adapter.configure('交付顾问','任务问候语')=={}

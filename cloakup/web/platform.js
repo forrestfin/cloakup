@@ -411,10 +411,16 @@ function readTaskSchedule(f){
 function taskWindowLabel(s){return s?.enabled?`${s.weekdays.map(i=>'周'+['一','二','三','四','五','六','日'][i]).join('、')} ${s.windows.map(w=>w.start+'–'+w.end).join(' / ')}（${s.timezone||'Asia/Shanghai'}）`:'全天';}
 
 // Job facts are edited and validated inside the owning task.
+// 11-26 管理员问“基于 JD 的岗位事实从哪看到”：逐句列出可直接引用的 JD 句（带来源编号）与被拦原因。
+function jdReviewList(c){
+ const review=c.jd_review||[],usable=review.filter(r=>r.id),blocked=review.filter(r=>!r.id);
+ return `<h3>可直接引用的 JD 句</h3><p class="helper">由上方 JD 自动拆出，候选人问到时原句作答；已确认事实与常见问题优先。修改 JD 后随之更新。</p>${usable.length?`<ol class="jd-review">${usable.map(r=>`<li><span class="meta mono">${esc(r.id)}</span> ${esc(r.text)}</li>`).join('')}</ol>`:'<p class="helper">JD 中暂无可直接引用的句子。</p>'}${blocked.length?`<details><summary>未使用的 ${blocked.length} 句及原因</summary><ul>${blocked.map(r=>`<li>${esc(r.text)} <span class="meta">（${esc(r.reason)}）</span></li>`).join('')}</ul></details>`:''}`;
+}
+
 function taskPublishedFacts(task,c){
  if(ui.taskFactsEditing===c.id||taskFactsDraft(task))return taskFactsEditor(task,c);
  const facts=c.confirmed_facts||[],faq=c.faq||[];
- return `<section class="surface"><div class="section-head"><div><h2>${esc(c.job.label)}</h2><p>生效岗位事实 · 配置 v${task.revision}</p></div><button class="btn" data-task-facts-edit="${c.id}">编辑岗位资料与寻访配置</button></div><div class="platform-details"><h3>岗位 JD</h3><p class="preserve">${esc(c.job.snapshot?.requirements||'尚未补充岗位描述')}</p><h3>岗位寻访配置</h3><p>首聊：${esc(c.job_sourcing?.greeting??c.desired_greeting??'尚未设置')}</p><p>职业关键词：${esc((c.job_sourcing?.outreach_terms||c.execution?.outreach_terms||[]).join('、')||'不额外预筛')}</p><p>推荐条件：${esc((c.job_sourcing?.recommend_filters||c.recommend_filters||[]).join('、')||'不额外筛选')}</p><h3>已确认事实</h3>${facts.length?`<dl class="facts-list">${facts.map(f=>`<dt>${esc(f.kind||'业务信息')}</dt><dd>${esc(f.value)}</dd>`).join('')}</dl>`:'<p class="helper">尚未补充确认事实。</p>'}<h3>常见问题</h3>${faq.map(f=>`<details class="task-faq"><summary>${esc(f.question)}</summary><p class="preserve">${esc(f.answer)}</p></details>`).join('')||'<p class="helper">尚无常见问题。</p>'}<p class="helper">调整先进入草案，验证并发布后用于执行。</p></div></section>`;
+ return `<section class="surface"><div class="section-head"><div><h2>${esc(c.job.label)}</h2><p>生效岗位事实 · 配置 v${task.revision}</p></div><button class="btn" data-task-facts-edit="${c.id}">编辑岗位资料与寻访配置</button></div><div class="platform-details"><h3>岗位 JD</h3><p class="preserve">${esc(c.job.snapshot?.requirements||'尚未补充岗位描述')}</p>${jdReviewList(c)}<h3>岗位寻访配置</h3><p>首聊：${esc(c.job_sourcing?.greeting??c.desired_greeting??'尚未设置')}</p><p>职业关键词：${esc((c.job_sourcing?.outreach_terms||c.execution?.outreach_terms||[]).join('、')||'不额外预筛')}</p><p>推荐条件：${esc((c.job_sourcing?.recommend_filters||c.recommend_filters||[]).join('、')||'不额外筛选')}</p><h3>已确认事实</h3>${facts.length?`<dl class="facts-list">${facts.map(f=>`<dt>${esc(f.kind||'业务信息')}</dt><dd>${esc(f.value)}</dd>`).join('')}</dl>`:'<p class="helper">尚未补充确认事实。</p>'}<h3>常见问题</h3>${faq.map(f=>`<details class="task-faq"><summary>${esc(f.question)}</summary><p class="preserve">${esc(f.answer)}</p></details>`).join('')||'<p class="helper">尚无常见问题。</p>'}<p class="helper">调整先进入草案，验证并发布后用于执行。</p></div></section>`;
 }
 
 document.addEventListener('click',e=>{const todo=e.target.closest('[data-today-todo]');if(todo){ui.todoSelection=todo.dataset.todayTodo;ui.todoFilter='open';}},true);  // 捕获阶段先选中待办，再由 data-nav 跳到待办中心

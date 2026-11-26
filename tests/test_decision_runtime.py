@@ -440,7 +440,7 @@ def _first_contact_env(env,monkeypatch,count,choose,closes=False,list_ok=True):
   geek=person['profile']['geek_id'];seen['proposals'].append(geek)
   return {'action':choose(geek),'reason':'依据职业线索判断','fact_index':-1},{},{}
  class Adapter:
-  def __init__(self,session):pass
+  def __init__(self,session,require_greeting_proof=True):assert require_greeting_proof is False
   async def prepare(self,case,person,message):raise _Contacted(person['profile']['geek_id'])
  m.event=lambda *a:None
  async def no_sleep(seconds):seen.setdefault('pauses',[]).append(seconds)
@@ -526,7 +526,7 @@ async def test_first_contact_profile_change_sets_aside_only_that_candidate(env,m
   monkeypatch.setattr(ap,'open_profile',changed)
  else:
   class Adapter:
-   def __init__(self,session):pass
+   def __init__(self,session,require_greeting_proof=True):assert require_greeting_proof is False
    async def prepare(self,case,person,message):raise ProfileChanged('当前资料弹层已变化，需重新核对收件人')
   monkeypatch.setattr(ap,'BossRecommendContact',Adapter)
  session=NS(_boss_recommend_detail={'geek_id':'g0'})

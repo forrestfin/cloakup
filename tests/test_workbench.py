@@ -527,3 +527,13 @@ def test_snapshot_reads_lock_tables_once(manager, monkeypatch):
     snap=manager.call(manager.snapshot())
     assert len(calls)==1 and {c['id']:c['config_locked_by'] for c in snap['cases']}==locks
     assert locks[cases[0]['id']]=={'id':task['id'],'name':'寻访任务'} and locks[cases[1]['id']] is None
+
+
+def test_state_lists_jd_review_per_case(manager):
+    # 11-26 管理员问“基于 JD 的岗位事实从哪看到”：状态里逐岗位给出 JD 句可用／被拦。
+    case=manager.cases.create('https://www.zhipin.com/web/chat/job/edit?encryptId=jd')
+    case['job']['snapshot']={'location':'','requirements':'1、直接向品质负责人汇报。 2、8-12K＋绩效奖金。'};manager.cases.save(case)
+    async def scenario():
+        view=next(c for c in (await manager.snapshot())['cases'] if c['id']==case['id'])
+        assert [(r['id'],r['text'],r['reason']) for r in view['jd_review']]==[('jd:0','直接向品质负责人汇报。',None),(None,'8-12K＋绩效奖金','含薪酬数字')]
+    manager.call(scenario())

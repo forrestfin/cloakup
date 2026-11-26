@@ -100,9 +100,14 @@ class AttentionStore:
             try:task=self.db.get('task',record['task_id']);case=next(c for c in cases if c['id']==record['case_id'])
             except (FileNotFoundError,StopIteration):continue
             if record['case_id'] not in task['config'].get('case_ids',[]):continue
+            # 已撤出首聊的岗位不再挂话术待办（11-26 FDE 撤出后仍显示“待核验”）。
+            from .job_members import outreach_ids
+            if record['case_id'] not in outreach_ids(task['config']):continue
             if stamp(render(case.get('job_sourcing',{}).get('greeting',case.get('desired_greeting','')),case))!=record.get('expected_hash'):continue
             greeting_states.append(record)
-            if record['status']=='blocked':
+            if record['status']=='unverified':
+                add('greeting:'+record['task_id']+':'+record['case_id']+':'+record['expected_hash'],'greeting','首聊话术未能写入 BOSS',record['reason']+'；首聊照常进行，候选人收到的是 BOSS 上该岗位现有的招呼语。系统约 10 分钟后会再试写入；如需立即一致，可在 BOSS 后台“按职位设置招呼语”里改成本任务的问候语，写入成功后此待办自动解除。',task_id=record['task_id'],case_id=record['case_id'],job_label=record.get('job_label',''),greeting_state_id=record['id'])
+            elif record['status']=='blocked':
                 add('greeting:'+record['task_id']+':'+record['case_id']+':'+record['expected_hash'],'greeting','本岗位首聊话术待核验',record['reason']+'；仅限制该岗位新增开聊，已有会话和其他岗位继续处理。',task_id=record['task_id'],case_id=record['case_id'],job_label=record.get('job_label',''),greeting_state_id=record['id'])
         active_cases={r.get('params',{}).get('case_id') for r in runs if r.get('mode')=='boss_autopilot' and r.get('status')=='running' and r.get('params',{}).get('case_id')}
         latest={}

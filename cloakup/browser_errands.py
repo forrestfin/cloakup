@@ -309,7 +309,10 @@ async def run_direct(manager, job, session):
 
 async def after_run(manager, job):
     """代办运行结束后：运行期间新登记的代办（不在开始时的快照里）不能被丢下——浏览器空闲、在执行时段内就再起一次（同样有上限）。"""
-    late = [r for r in _queue(manager.db) if r['id'] not in (job.get('errand_snapshot') or [])]
+    if 'errand_snapshot' not in job:
+        # 浏览器没起来（如授权未通过），这次运行根本没碰代办：不续跑，否则会无上限地反复启动浏览器（11-26 现场）。
+        log('state', type='browser_errand', step='follow_up_skipped', actor='system', reason='run_never_reached_queue');return None
+    late = [r for r in _queue(manager.db) if r['id'] not in job['errand_snapshot']]
     if not late or manager.busy() or not window_open(manager):return None
     try:return await manager.create({'mode': 'boss_errand', 'params': {}})
     except ValueError as exc:

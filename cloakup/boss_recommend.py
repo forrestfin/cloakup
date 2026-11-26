@@ -115,8 +115,11 @@ async def open_list(session, case):
     session.max_elements = max(session.max_elements, 700)
     greeting=case.get('platform_greeting_text')
     if greeting and not current_greeting(session,case['job']['label'],greeting,job_identity(case)):
-        proof=await existing_greeting(session,case['job']['label'],greeting)
-        session._boss_greeting={**proof,'job_id':job_identity(case)}
+        # 11-26 管理员决定“照写不拦”：复核失败只是没有凭证，不挡推荐页；人工审阅开聊在 prepare 里仍要求凭证。
+        try:
+            proof=await existing_greeting(session,case['job']['label'],greeting)
+            session._boss_greeting={**proof,'job_id':job_identity(case)}
+        except GreetingVerificationError:session._boss_greeting=None
     session._boss_recommend_detail = None
     session._boss_recommend_list = None
     await session.navigate(RECOMMEND_URL)
@@ -330,11 +333,22 @@ async def existing_greeting(session,title,text):
 
 
 class BossRecommendContact(BossFirstContact):
+    def __init__(self,session,require_greeting_proof=True):
+        # 自动首聊（11-26 管理员决定“照写不拦”）不要求岗位话术核对凭证：BOSS 点“打招呼”发出该岗位现有的招呼语。
+        super().__init__(session);self.require_greeting_proof=require_greeting_proof
+
     async def prepare(self,case,candidate,message):
         self.case=case
         self.expected_fingerprint=candidate['profile'].get('review_card_sha256')
         if not self.expected_fingerprint:
             raise SourcingError('缺少已审阅的普通推荐资料快照')
+        if not self.require_greeting_proof:
+            proof=await self.candidate(candidate['profile']['geek_id'],job_identity(case))
+            greeting=current_greeting(self.s,case['job']['label'],message['text'],job_identity(case))
+            return {**proof,'title':case['job']['label'],'greeting_action':'platform',
+                    'text_sha256':hashlib.sha256(message['text'].encode()).hexdigest(),
+                    'greeting_checked_at':greeting['checked_at'] if greeting else None,
+                    'scope':'使用 BOSS 上本岗位现有的招呼语，只向当前候选人普通推荐开聊一次'}
         if case.get('platform_greeting_text')!=message['text']:
             raise GreetingVerificationError('当前草稿不是本岗位已配置的话术；请先重新核对设置')
         proof=await self.candidate(candidate['profile']['geek_id'],job_identity(case))
@@ -347,6 +361,7 @@ class BossRecommendContact(BossFirstContact):
 
     async def configure(self,title,text):
         proof=current_greeting(self.s,title,text,job_identity(self.case))
+        if not proof and not self.require_greeting_proof:return {}
         if not proof:raise GreetingVerificationError('岗位话术核对已超过五分钟或正文变化，请重新预览；未执行联系')
         return dict(proof)
 

@@ -103,7 +103,8 @@ async def ensure(manager,job,session,case):
  try:prior=manager.db.get('greeting_readiness',ident)
  except FileNotFoundError:prior={}
  revision=case.get('task_policy',{}).get('revision',0)
- if prior.get('status')=='blocked' and prior.get('expected_hash')==stamp(text) and prior.get('task_revision')==revision and prior.get('next_check_at',0)>time.time():return False
+ # 11-26 管理员决定“照写不拦”：上次写入未成功且还没到重试时间，不再打开设置页，首聊照常（候选人收到 BOSS 上现有的招呼语）。
+ if prior.get('status') in ('blocked','unverified') and prior.get('expected_hash')==stamp(text) and prior.get('task_revision')==revision and prior.get('next_check_at',0)>time.time():return True
  state={'id':ident,'task_id':task_id,'case_id':case['id'],'job_label':case['job']['label'],'job_id':job_identity(case),'task_revision':revision,'expected_text':text,'expected_hash':stamp(text),'status':'checking','checked_at':time.time(),'actual_text':None,'reason':'','next_check_at':None,'settings_write_attempted':False,'save_uncertain':prior.get('save_uncertain',False)}
  async def guard():
   await manager.checkpoint(job)
@@ -138,10 +139,11 @@ async def ensure(manager,job,session,case):
   # Account/login/risk controls retain their fatal safety boundary.
   if any(word in str(exc) for word in ('登录','账号存在异常','过于频繁','平台要求验证')):raise
   reason=str(exc) if isinstance(exc,(SourcingError,ValueError)) else '平台话术读取或同步暂未完成（'+getattr(session,'_greeting_stage','核验')+'）；未新增联系'
-  state.update(status='blocked',reason=reason,next_check_at=time.time()+jitter(600),checked_at=time.time())
+  # 写入或读回失败只记提示、约 10 分钟后再试写入，不拦首聊；登录、平台验证等页面级问题已在上面原样抛出。
+  state.update(status='unverified',reason=reason,next_check_at=time.time()+jitter(600),checked_at=time.time())
   manager.db.put('greeting_readiness',ident,state)
-  if prior.get('reason')!=reason or prior.get('expected_hash')!=state['expected_hash']:manager.event(job,'step','仅暂停本岗位新增开聊：'+reason+'；已有会话和其他岗位继续处理')
-  return False
+  if prior.get('reason')!=reason or prior.get('expected_hash')!=state['expected_hash']:manager.event(job,'step','首聊话术未能写入 BOSS：'+reason+'；首聊照常进行，候选人会收到 BOSS 上该岗位现有的招呼语，约 10 分钟后再试写入')
+  return True
 
 
 def block(manager,job,case,reason):

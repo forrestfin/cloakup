@@ -233,6 +233,8 @@ def test_new_outreach_and_isolation_event_texts_are_classified():
     from cloakup.daily_report import _classify
     assert _classify({'message':'主动开聊入口暂不可用（未找到唯一的实际页面控件：推荐），先继续处理收件，约 15 分钟后重试开聊'})==('outreach_entry','retry')
     assert _classify({'message':'岗位有未核实的隔离会话（隔离不足 2 小时），暂缓新增开聊'})==('isolation','outreach_held')
+    # 11-26 “照写不拦”：话术写入失败不再暂停开聊，单列为自动重试。
+    assert _classify({'message':'首聊话术未能写入 BOSS：岗位设置页面尚未加载；未修改；首聊照常进行，候选人会收到 BOSS 上该岗位现有的招呼语，约 10 分钟后再试写入'})==('greeting_unwritten','retry')
 
 
 def test_job_validation_lapse_is_classified_and_reported(env):

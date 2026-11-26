@@ -27,6 +27,7 @@ from typing import Any
 import yaml
 
 from .answering import ANSWER_ORDER, ANSWER_POLICY_VERSION
+from .conversation_semantics import jd_review
 from .account_execution import AccountExecution
 from .agent import WebAgent
 from .browser import BrowserSession
@@ -569,7 +570,7 @@ class Workbench:
             "ui_version": str((ASSETS / "app.js").stat().st_mtime_ns),
             "definitions": self.definitions.list(), "readiness": self.latest_readiness(), "executor_checks": executor_checks, "database": self.db.backend, "runtime": "docker" if Path("/.dockerenv").exists() else "local",
             "capabilities": {"boss_first_contact": True, "boss_recommend": True, "boss_autopilot": True},
-            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c),"config_locked_by":locks.get(c['id'])} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
+            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c),"config_locked_by":locks.get(c['id']),"jd_review":jd_review(c)} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
             "busy": self.busy()["id"] if self.busy() else None})
 
     def today_view(self,cases):

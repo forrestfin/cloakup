@@ -29,7 +29,7 @@ cffi==2.1.1
     # via cryptography
 charset-normalizer==3.5.2
     # via requests
-cloakbrowser==0.7.2
+cloakbrowser==0.7.3
     # via cloakup (pyproject.toml)
 cryptography==50.0.2
     # via cloakbrowser
@@ -107,9 +107,9 @@ pydantic-core==2.50.4
 pyee==14.0.0
     # via playwright
 pygments==2.21.0
-pypdf==7.1.1
-    # via cloakup
     # via pytest
+pypdf==7.1.1
+    # via cloakup (pyproject.toml)
 pytest==9.2.0
     # via
     #   cloakup (pyproject.toml)

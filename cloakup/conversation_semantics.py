@@ -16,7 +16,7 @@ from .autonomy import validate_reply
 from .recruiting_ai import APPROVED_HOST
 from .sourcing import SourcingError
 
-VERSION = 3
+VERSION = 4
 CONSENT_ID = 'recruiting-conversation'
 
 
@@ -48,7 +48,8 @@ SYSTEM = '''你是招聘任务的对话语义规划器，代表当前登录账�
 route=continue 用于普通交流；answer 用于有确认来源的问题；clarify 用于含义确实不清；defer 只用于明确业务问题且 sources 真的缺少答案。没有关键词匹配不是事实缺失。指代通过前文解析。已经有依据的远程、职责、薪酬结构等不要转人工；具体薪酬数字是披露边界而非缺失事实，使用 salary_boundary。不得把岗位事实中服务对象、交付对象或客户的薪酬水平冒充本岗位薪酬。
 回答先承接对方语言。正常交流可推进简历，表达先了解/不愿提供时尊重节奏；不要收到一句回复就认定同意所有操作。每次只提出一个问题，ask_focus、clarify、resume不能叠加。使用introduce必须紧接实际岗位事实，不能说介绍却不给内容。收到简历不再索要，申请等待中不重复索要；但当 state.resume_text_invite_open 为真（平台求简历申请等待中）且候选人正向交流、没有新业务问题时，应以 resume 作为唯一下一步文字索要简历，不得用 ask_focus 等泛泛追问代替；每条新的正向回复都可以这样索要。明确拒绝或稍后用 decline/later；自动化身份询问用 identity，由本机如实回应。
 parts 是本次回应的有序片段 ID，只能选择 catalog 中提供的会话短句或 sources 的已确认事实/FAQ，禁止新增或改写事实。可组合承接语、相关事实、下一步；避免堆砌所有事实。route=defer 必须填写 candidate_question 和具体 missing_information，且末尾使用 confirm_missing；已知部分仍可先给来源。不凭空承诺核实对方没问的安排。continue/answer 可选择 resume推进，先了解时使用resume_later；clarify只能澄清，不能假装缺事实。回复不要机械地每次感谢。
-sources非空不等于能回答所有问题，冲突事实不能自选一条。missing_information 与 candidate_question 只是本机待办证据，不是对外正文。grounding_ids列出parts中所有sources ID。只输出符合schema的JSON。'''
+sources非空不等于能回答所有问题，冲突事实不能自选一条。missing_information 与 candidate_question 只是本机待办证据，不是对外正文。grounding_ids列出parts中所有sources ID。只输出符合schema的JSON。
+sources 中 kind=jd 的条目是岗位 JD 原句，与已确认事实、FAQ 一样算有确认来源，可直接引用作答；同一问题上 JD 句与已确认事实或 FAQ 说法不同时，只能引用已确认事实或 FAQ。'''
 
 
 def consent(manager):
@@ -99,7 +100,7 @@ def redact(text,person):
 
 def source_catalog(case):
     from .answering import UNCERTAIN
-    from .facts import facts_for
+    from .facts import facts_for,jd_statements
     from .communication_policy import check_compensation_disclosure
     from .recruiting_ai import checked_brief
     result={}
@@ -108,6 +109,10 @@ def source_catalog(case):
             result['fact:'+fact['id']]={'text':fact['value'],'kind':'fact','revision':fact.get('revision',case.get('config_revision',0))}
     for i,item in enumerate(case.get('faq',[])):
         if item.get('enabled') and not UNCERTAIN.search(item['answer']):result['faq:'+str(i)]={'text':item['answer'],'question':item['question'],'kind':'faq','revision':case.get('config_revision',0)}
+    # 11-26 16:04 qe工程师：JD 写明汇报对象却转了顾问。JD 原句作为来源排在事实与 FAQ 之后；与已确认地点、经验、学历矛盾的句子不进目录。
+    confirmed=[f for f in facts_for(case) if f.get('status')=='confirmed' and f.get('scope')=='job']
+    for i,text in enumerate(jd_statements(case)):
+        if not contradicts(text,confirmed):result['jd:'+str(i)]={'text':text,'kind':'jd','revision':(case.get('job') or {}).get('revision',0)}
     safe={}
     for ident,item in result.items():
         try:
@@ -116,6 +121,49 @@ def source_catalog(case):
         except (ValueError,SourcingError):continue
         safe[ident]=item
     return safe
+
+
+LOCATION_LINE=re.compile(r'工作地点|办公地点|办公地址|工作地址|base|常驻|驻场|坐标|地点',re.I)
+
+
+def contradicts(text,confirmed):
+    """JD 句与同类已确认事实真的矛盾才剔除。
+
+    地点：已有已确认地点时，说到地点的 JD 句都不进目录（11-26 终审 C2、16:43 隔离验收）。
+    经验：紧邻“年”的整数与“不限”须都在已确认说法里；学历：级别与“不限”同理（11-26 终审 I5）。
+    """
+    from .facts import ANCHORS,PLACE
+    known=lambda kind:[f.get('value','') for f in confirmed if f.get('kind')==kind]
+    # 11-26 只读演练：已确认地点可能列多个城市（“深圳、武汉、杭州”），逐个取；远程岗位不报 BOSS 发布地址生成的“工作地点：”行。
+    places=[part.strip()[:2] for v in known('work_arrangement') if re.search(r'地点|地址',v) for part in re.split(r'[、，,/／\s]+',v.split('：')[-1]) if part.strip()]
+    if text.startswith('工作地点：') and any(re.search(r'远程|居家|地区不限|不限地点',v) for v in known('work_arrangement')):return '远程岗位，不报发布地址'
+    # 11-26 16:43 隔离验收：已确认地点与 JD 地点句并存时模型判为口径不一致转人工；已确认地点优先，JD 地点句一律不进目录。
+    if places and (LOCATION_LINE.search(text) or PLACE.search(text)):return '已有确认地点，以已确认事实为准'
+    for kind,pattern in (('experience',r'\d+(?=\s*(?:[-~至到]\s*\d+\s*)?年)'),('education',r'大专|本科|硕士|博士')):
+        values=known(kind)
+        if not values or not re.search(ANCHORS[kind]+r'|(?:经验|经历)不限',text):continue
+        digits=lambda v:re.sub(r'[一二两三四五六七八九十]',lambda m:str('一二三四五六七八九十'.find(m.group(0).replace('两','二'))+1),v)
+        values=[digits(v) for v in values];text_kind=digits(text)
+        have=set(re.findall(pattern,' '.join(values)))|({'不限'} if '不限' in ''.join(values) else set())
+        want=set(re.findall(pattern,text_kind))|({'不限'} if '不限' in text else set())
+        if want-have:return '与已确认的经验或学历不一致'
+    return None
+
+
+def jd_review(case):
+    """“岗位与事实”页逐句展示：可引用的带来源编号（与 source_catalog 一致），被拦的写明原因。"""
+    from .facts import facts_for,jd_lines
+    confirmed=[f for f in facts_for(case) if f.get('status')=='confirmed' and f.get('scope')=='job']
+    catalog=source_catalog(case);out=[];index=0
+    for text,reason in jd_lines(case):
+        ident=None
+        if reason is None:
+            reason=contradicts(text,confirmed)
+            if not reason and 'jd:%d'%index in catalog:ident='jd:%d'%index
+            elif not reason:reason='未通过对外校验'
+            index+=1
+        out.append({'id':ident,'text':text,'reason':reason})
+    return out
 
 
 def resume_text_invite_open(person):

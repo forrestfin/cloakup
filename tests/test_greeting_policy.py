@@ -32,10 +32,10 @@ async def test_unknown_save_is_read_only_across_repeated_attempts(env,monkeypatc
  m,j,s,c=env;monkeypatch.setattr(gp,'read_settings',AsyncMock(return_value=snapshot('旧话术')))
  async def uncertain(*args):args[-1]();raise TimeoutError()
  spy=AsyncMock(side_effect=uncertain);monkeypatch.setattr(gp,'synchronize',spy)
- assert not await gp.ensure(m,j,s,c)
+ assert await gp.ensure(m,j,s,c)
  for _ in range(2):
   record=m.db.list('greeting_readiness')[0];record['next_check_at']=0;m.db.put('greeting_readiness',record['id'],record)
-  assert not await gp.ensure(m,j,s,c)
+  assert await gp.ensure(m,j,s,c)
  assert spy.await_count==1 and m.db.list('greeting_readiness')[0]['save_uncertain']
  monkeypatch.setattr(gp,'read_settings',AsyncMock(return_value=snapshot(c['desired_greeting'])));record=m.db.list('greeting_readiness')[0];record['next_check_at']=0;m.db.put('greeting_readiness',record['id'],record)
  assert await gp.ensure(m,j,s,c);assert not m.db.list('greeting_readiness')[0]['save_uncertain']
@@ -45,14 +45,29 @@ async def test_duplicate_job_rows_and_disabled_settings_never_write(env,monkeypa
  for state in [dict(snapshot('旧'),enabled=False),dict(snapshot('旧'),rows=[{'title':'招聘顾问','text':'旧'}]*2)]:
   monkeypatch.setattr(gp,'read_settings',AsyncMock(return_value=state))
   for r in m.db.list('greeting_readiness'):r['next_check_at']=0;m.db.put('greeting_readiness',r['id'],r)
-  assert not await gp.ensure(m,j,s,c)
+  assert await gp.ensure(m,j,s,c)
  spy.assert_not_awaited()
 
 async def test_other_job_changes_fail_verification(env,monkeypatch):
  m,j,s,c=env;after=snapshot(c['desired_greeting']);after['rows'][1]['text']='被意外修改'
  monkeypatch.setattr(gp,'read_settings',AsyncMock(side_effect=[snapshot('旧'),after]));monkeypatch.setattr(gp,'synchronize',AsyncMock())
- assert not await gp.ensure(m,j,s,c);assert m.db.list('greeting_readiness')[0]['status']=='blocked'
+ assert await gp.ensure(m,j,s,c);assert m.db.list('greeting_readiness')[0]['status']=='unverified'
  assert m.cases.load(c['id'])['platform_greeting_text']=='旧话术'
+
+async def test_failed_write_lets_first_contact_go_ahead_and_retries_later(env,monkeypatch):
+ # 11-26 管理员决定：首聊话术照写不拦。写入或读回失败只记提示，首聊照常（候选人收到 BOSS 上现有的招呼语）；约 10 分钟后再试写入。
+ m,j,s,c=env;events=[];m.event=lambda job,kind,text:events.append(text)
+ read=AsyncMock(side_effect=gp.GreetingUnavailable('岗位设置页面尚未加载；未修改'));monkeypatch.setattr(gp,'read_settings',read)
+ assert await gp.ensure(m,j,s,c)
+ state=m.db.list('greeting_readiness')[0];assert state['status']=='unverified' and state['next_check_at']>0
+ assert any('首聊照常' in e for e in events)
+ assert await gp.ensure(m,j,s,c);assert read.await_count==1
+ state['next_check_at']=0;m.db.put('greeting_readiness',state['id'],state)
+ assert await gp.ensure(m,j,s,c);assert read.await_count==2
+
+async def test_login_problems_still_stop_the_greeting_step(env,monkeypatch):
+ m,j,s,c=env;monkeypatch.setattr(gp,'read_settings',AsyncMock(side_effect=gp.GreetingUnavailable('BOSS 已显示登录表单')))
+ with pytest.raises(gp.GreetingUnavailable):await gp.ensure(m,j,s,c)
 
 def test_parameter_rendering_is_per_job_and_rejects_unresolved_parameters():
  assert gp.render('您好，{{岗位名称}}',{'job':{'label':'岗位甲'}})=='您好，岗位甲'
@@ -66,6 +81,17 @@ def test_greeting_todos_are_task_job_scoped_and_deduplicated(env):
  ident=gp.key(t['id'],c['id']);m.db.put('greeting_readiness',ident,{'id':ident,'task_id':t['id'],'case_id':c['id'],'expected_hash':gp.stamp('您好'),'status':'blocked','reason':'未找到编辑控件'})
  inbox=AttentionStore(m.db);inbox.reconcile([],m.cases.list());inbox.reconcile([],m.cases.list());todos=[v for v in m.db.list('attention') if v['kind']=='greeting'];assert len(todos)==1 and todos[0]['task_id']==t['id']
  r=m.db.get('greeting_readiness',ident);r['status']='verified';m.db.put('greeting_readiness',ident,r);inbox.reconcile([],m.cases.list());assert m.db.get('attention',todos[0]['id'])['status']=='resolved'
+
+def test_unwritten_greeting_is_a_reminder_and_withdrawn_jobs_raise_none(env):
+ # 11-26：写入失败不再拦首聊，待办改为提醒“候选人会收到 BOSS 上现有的招呼语”；撤出首聊的岗位（FDE）不再挂话术待办。
+ from cloakup.attention import AttentionStore
+ m,j,s,c=env;t=m.definitions.list()[0];c['job_sourcing']['greeting']='您好';m.cases.save(c)
+ ident=gp.key(t['id'],c['id']);m.db.put('greeting_readiness',ident,{'id':ident,'task_id':t['id'],'case_id':c['id'],'expected_hash':gp.stamp('您好'),'status':'unverified','reason':'岗位设置页面尚未加载；未修改'})
+ inbox=AttentionStore(m.db);inbox.reconcile([],m.cases.list())
+ todos=[v for v in m.db.list('attention') if v['kind']=='greeting' and v['status']!='resolved'];assert len(todos)==1
+ assert todos[0]['title']=='首聊话术未能写入 BOSS' and 'BOSS 上该岗位现有的招呼语' in todos[0]['detail'] and '限制' not in todos[0]['detail']
+ task=m.db.get('task',t['id']);task['config']['members']=[{'case_id':c['id'],'weight':1,'outreach':'withdrawn'}];m.db.put('task',t['id'],task)
+ inbox.reconcile([],m.cases.list());assert m.db.get('attention',todos[0]['id'])['status']=='resolved'
 
 async def test_one_job_block_does_not_stop_inboxes_or_next_job(env,monkeypatch):
  import asyncio
