@@ -538,7 +538,8 @@ async def sync_and_follow(manager,job,session,case):
         from .boss_contact_consent import needs_sync
         contact_pending=needs_sync(case,c)
         pending_ack=bool(c and c.get('pending_question_id') and c.get('inbox') and c['inbox'][-1]['external_id']==c['pending_question_id'] and not any(m['status'] in ('sending','delivery_unknown') or (m.get('decision',{}).get('pending_ack') and m['decision'].get('reply_id')==c['pending_question_id'] and m['status']=='sent') for m in c['outbox']))
-        archive_pending=bool(c and (c.get('resume_archive_requested') or any(c.get('resume_archives',{}).get(ref,{}).get('status') in (None,'queued','downloading') for ref in c.get('resumes',[]) if ref.startswith('platform-message:'))))
+        from .resume_archive import archive_pending as needs_archive
+        archive_pending=needs_archive(c)
         from .decision_runtime import reply_target
         from .answering import answer_question
         hidden=reply_target(c) if c else None

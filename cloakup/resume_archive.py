@@ -52,10 +52,22 @@ def word_preview(data):
  paragraphs=[''.join(t.text or '' for t in p.findall('.//w:t',ns)) for p in root.findall('.//w:p',ns)]
  return ('<!doctype html><meta charset="utf-8"><title>简历归档</title><main>'+''.join('<p>'+html.escape(p)+'</p>' for p in paragraphs)+'</main>').encode()
 
+# 11-26 17:45 周全起：服务重建打断下载后被记成“失败”，之后不再下载，也没推到飞书群。
+# 中断（含修复前记成 failed／“归档中断…”的旧记录）在下次拜访自动重试；真正失败的等管理员处理（attention 生成待办）。
+LEGACY_INTERRUPTED='归档中断，可手动重新归档'
+def retryable(state):
+ return state.get('status')!='archived' and (state.get('status')!='failed' or state.get('error')==LEGACY_INTERRUPTED)
+
+def archive_pending(person):
+ """执行器是否要回到这个会话归档简历：管理员请求过，或有未存档且可重试的附件。"""
+ if not person:return False
+ states=person.get('resume_archives',{})
+ return bool(person.get('resume_archive_requested') or any(retryable(states.get(ref,{})) for ref in person.get('resumes',[]) if ref.startswith('platform-message:')))
+
 async def capture(manager,job,session,case_id,candidate_id,snapshot):
  store=manager.cases;case=store.load(case_id);person=store.candidate(case,candidate_id)
  states=person.setdefault('resume_archives',{})
- pending=[m for m in snapshot['messages'] if m.get('resume') and m['direction']=='in' and m.get('resume_selector') and states.get('platform-message:'+m['external_id'],{}).get('status') not in ('archived','failed')]
+ pending=[m for m in snapshot['messages'] if m.get('resume') and m['direction']=='in' and m.get('resume_selector') and retryable(states.get('platform-message:'+m['external_id'],{}))]
  if not pending:return
  message=pending[0];source='platform-message:'+message['external_id'];states[source]={'status':'downloading','at':time.time()};store.save(case)
  original=session.page;pages_before=list(session.context.pages);responses=[];tasks=[];downloads=[]
@@ -120,7 +132,7 @@ async def capture(manager,job,session,case_id,candidate_id,snapshot):
   person.pop('resume_archive_requested',None)
   save_file(store,case,person,source,data,filename)
  except asyncio.CancelledError:
-  case=store.load(case_id);person=store.candidate(case,candidate_id);person.setdefault('resume_archives',{})[source]={'status':'failed','error':'归档中断，可手动重新归档','at':time.time()};store.save(case);raise
+  case=store.load(case_id);person=store.candidate(case,candidate_id);person.setdefault('resume_archives',{})[source]={'status':'interrupted','at':time.time()};store.save(case);raise
  except Exception as exc:
   case=store.load(case_id);person=store.candidate(case,candidate_id);person.pop('resume_archive_requested',None);person.setdefault('resume_archives',{})[source]={'status':'failed','error':str(exc)[:300],'at':time.time()};store.audit(case,'resume_archive_failed',candidate_id=candidate_id,reason=str(exc)[:300])
  finally:

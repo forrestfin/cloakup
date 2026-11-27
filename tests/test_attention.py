@@ -551,3 +551,15 @@ def test_question_todo_names_the_question_before_a_resume_card(tmp_path,monkeypa
  c={'id':'c','job':{'label':'岗位'},'candidates':{'p':{'id':'p','status':'resume_received','inbox':inbox,'outbox':[],'resumes':[{'id':'r'}]}}}
  todos=[t for t in store.reconcile([], [c]) if t['kind']=='question']
  assert [(t['question'],t['reply_id']) for t in todos]==[('还有其他职位吗','q')]
+
+
+def test_failed_resume_archive_raises_todo_until_archived(tmp_path):
+ # 11-26 周全起：简历归档失败只留在候选人记录里，管理员不知道这份简历没推到飞书群。
+ store=AttentionStore(Database(tmp_path))
+ person={'id':'p','status':'resume_received','inbox':[],'outbox':[],'resumes':['platform-message:m1'],
+         'resume_archives':{'platform-message:m1':{'status':'failed','error':'未取得唯一PDF原文件','at':1}}}
+ c={'id':'c','job':{'label':'岗位'},'candidates':{'p':person}}
+ todos=[t for t in store.reconcile([], [c]) if t['kind']=='resume_archive']
+ assert len(todos)==1 and todos[0]['title']=='简历未能归档' and todos[0]['status']=='pending' and '未取得唯一PDF原文件' in todos[0]['detail']
+ person['resume_archives']['platform-message:m1']={'status':'interrupted','at':2}
+ assert [t for t in store.reconcile([], [c]) if t['kind']=='resume_archive'][0]['status']=='resolved'

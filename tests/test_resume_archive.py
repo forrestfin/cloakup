@@ -110,3 +110,65 @@ async def test_browser_image_response_is_archived_for_received_attachment(tmp_pa
  saved=store.candidate(store.load(c['id']),p['id']);assert len(saved['resume_files'])==1
  assert saved['resume_files'][0]['extension']=='jpg' and saved['resume_files'][0]['filename']=='简历.jpg'
  assert read_file(store,saved['resume_files'][0]['id'])[1]==original_body
+
+
+class _Emitter:
+ def __init__(self):self.pages=[]
+ def on(self,*a):pass
+ def remove_listener(self,*a):pass
+ def is_closed(self):return False
+
+
+def _interrupted_capture(tmp_path):
+ import asyncio
+ from types import SimpleNamespace as NS
+ from cloakup.resume_archive import capture
+ store,case,p=env(tmp_path);person=store.candidate(case,p['id']);person['conversation']={'chat_id':'1-0'};store.save(case)
+ async def stop(job):raise asyncio.CancelledError()
+ async def press(*a):pass
+ page=_Emitter();session=NS(page=page,context=_Emitter(),press_key=press)
+ manager=NS(cases=store,checkpoint=stop)
+ snap={'messages':[{'external_id':'m1','direction':'in','resume':True,'resume_selector':'#x','text':'某某-个人简历.pdf\n点击预览附件简历'}]}
+ with pytest.raises(asyncio.CancelledError):asyncio.run(capture(manager,{},session,case['id'],p['id'],snap))
+ return store,case,p,manager,session,snap
+
+
+def test_interrupted_archive_is_retried_on_next_visit(tmp_path):
+ # 11-26 17:45 qe工程师 周全起：简历刚收到 4 秒，服务重建打断下载，被记为“失败”，之后拜访不再下载，也没推到飞书群。
+ import asyncio
+ from cloakup.resume_archive import capture
+ store,case,p,manager,session,snap=_interrupted_capture(tmp_path)
+ state=store.candidate(store.load(case['id']),p['id'])['resume_archives']['platform-message:m1']
+ assert state['status']=='interrupted'
+ calls=[]
+ async def seen(job):calls.append(job);raise asyncio.CancelledError()
+ manager.checkpoint=seen
+ with pytest.raises(asyncio.CancelledError):asyncio.run(capture(manager,{},session,case['id'],p['id'],snap))
+ assert calls, '中断的归档应在下次拜访重新下载'
+
+
+def test_legacy_interrupted_failure_is_also_retried(tmp_path):
+ # 11-26 修复前被记成 failed／“归档中断，可手动重新归档”的记录（周全起）也要自动重试。
+ import asyncio
+ from cloakup.resume_archive import capture
+ store,case,p,manager,session,snap=_interrupted_capture(tmp_path)
+ fresh=store.load(case['id']);store.candidate(fresh,p['id'])['resume_archives']['platform-message:m1']={'status':'failed','error':'归档中断，可手动重新归档','at':1};store.save(fresh)
+ calls=[]
+ async def seen(job):calls.append(job);raise asyncio.CancelledError()
+ manager.checkpoint=seen
+ with pytest.raises(asyncio.CancelledError):asyncio.run(capture(manager,{},session,case['id'],p['id'],snap))
+ assert calls
+ fresh=store.load(case['id']);store.candidate(fresh,p['id'])['resume_archives']['platform-message:m1']={'status':'failed','error':'未取得唯一PDF原文件','at':1};store.save(fresh)
+ calls.clear();asyncio.run(capture(manager,{},session,case['id'],p['id'],snap))
+ assert not calls, '真正失败的不自动重试，等管理员处理'
+
+
+def test_executor_revisits_conversations_with_unfinished_archives():
+ # 11-26 周全起：中断的归档要让执行器主动回到会话重试，不只等对话自然有新消息。
+ from cloakup.resume_archive import archive_pending
+ ref='platform-message:m1'
+ person=lambda state:{'resumes':[ref],'resume_archives':{ref:state} if state is not None else {}}
+ assert archive_pending(person(None)) and archive_pending(person({'status':'queued'})) and archive_pending(person({'status':'downloading'}))
+ assert archive_pending(person({'status':'interrupted'})) and archive_pending(person({'status':'failed','error':'归档中断，可手动重新归档'}))
+ assert not archive_pending(person({'status':'failed','error':'未取得唯一PDF原文件'})) and not archive_pending(person({'status':'archived'}))
+ assert archive_pending({'resume_archive_requested':True}) and not archive_pending(None)

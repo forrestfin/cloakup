@@ -290,6 +290,11 @@ class AttentionStore:
                 # 决策暂缓和平台回执核验由执行器自己重试，不发给管理员。
                 # 知识库没有答案的问题在下面单独生成待办。
                 incoming=c.get('inbox',[])
+                # 11-26 周全起：简历归档失败只留在候选人记录里，管理员不知道这份简历没推到飞书群。
+                for source,state in (c.get('resume_archives') or {}).items():
+                    from .resume_archive import retryable
+                    if state.get('status')=='failed' and not retryable(state):
+                        add('resume_archive:'+case['id']+':'+c['id']+':'+source,'resume_archive','简历未能归档','已收到候选人的附件简历，但系统没能下载存档（'+str(state.get('error') or '原因未知')[:120]+'），因此也没有推送到飞书简历群。请在候选人详情的“简历归档”里点重新归档，系统会在下次拜访该会话时重新下载并推送；存档成功后此待办自动解除。',**refs)
                 # 对话因隐私规则暂缓时，候选人来信不会自动回复：必须让管理员看到，由顾问在平台接续。
                 from .decision_runtime import is_privacy_hold
                 if is_privacy_hold(c.get('decision_hold')) and c.get('status') not in ('closed','do_not_contact'):
