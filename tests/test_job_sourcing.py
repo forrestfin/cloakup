@@ -2,6 +2,7 @@ import copy
 import pytest
 from test_agent_workspace import setup,passing_test
 from cloakup.job_sourcing import checked,resolve
+import cloakup.job_sourcing as js
 from cloakup.agent_workspace import case_for,source
 from cloakup.task_policy import overlay
 from cloakup.scenario_workspace import ScenarioWorkspace
@@ -9,11 +10,11 @@ from cloakup.scenario_workspace import ScenarioWorkspace
 @pytest.fixture
 def jobs(setup):
  lab,m,t,first=setup
- first['job_sourcing']={'greeting':'您好，想交流招聘交付岗位。','outreach_terms':['招聘','人才交付'],'recommend_filters':['本科','5-10年']};m.cases.save(first)
+ first['job_sourcing']={'greeting':'您好，想交流招聘交付岗位。','outreach_terms':['招聘','人才交付'],'recommend_filters':['本科','5-10年'],'must_haves':[]};m.cases.save(first)
  second=m.cases.create('https://www.zhipin.com/web/chat/job/edit?encryptId=engineering')
  m.cases.bind_job(second,{'title':'研发工程师','requirements':'负责分布式系统研发。'})
  second['anonymous_job']={'role':'研发工程师','requirements':['负责分布式系统研发。']};m.cases.set_autonomy(second,True,source='test')
- second['job_sourcing']={'greeting':'您好，想交流分布式研发岗位。','outreach_terms':['分布式','后端'],'recommend_filters':['硕士','10年以上']};m.cases.save(second)
+ second['job_sourcing']={'greeting':'您好，想交流分布式研发岗位。','outreach_terms':['分布式','后端'],'recommend_filters':['硕士','10年以上'],'must_haves':[]};m.cases.save(second)
  cfg=copy.deepcopy(t['config']);cfg['case_ids']=[first['id'],second['id']];cfg['greeting']='遗留任务话术';cfg['execution']['outreach_terms']=['旧的共用词'];cfg['recommend_filters']=['博士']
  t=m.definitions.save({'expected_revision':t['revision'],'config':cfg},t['id'])
  return lab,m,t,first,second
@@ -65,6 +66,36 @@ def test_profile_validation_does_not_accept_unknown_fields_or_filters():
  assert checked(p,case)['outreach_terms']==['研发']
  for bad in ({**p,'shared':True},{**p,'recommend_filters':['未知条件']},{**p,'outreach_terms':[1]}):
   with pytest.raises(Exception):checked(bad,case)
+
+def test_checked_accepts_missing_must_haves(): # 11-27 旧版本 sourcing 无必须项键
+ case={'job':{'label':'研发岗位'}}
+ out=js.checked({'greeting':'您好','outreach_terms':[],'recommend_filters':[]},case)
+ assert out['must_haves']==[]
+ with pytest.raises(ValueError):js.checked({'greeting':'您好','outreach_terms':[]},case)
+
+def test_must_haves_validation():
+ items=js.checked_must_haves([{'text':' 有 SQE／供应商质量相关工作经历 ','source':'client_feedback','note':'客户 11-27'}])
+ assert items[0]['text']=='有 SQE／供应商质量相关工作经历' and items[0]['id'].startswith('mh_')
+ assert len(js.checked_must_haves([{'text':'甲','source':'jd'},{'text':' 甲','source':'jd'}]))==1
+ with pytest.raises(ValueError):js.checked_must_haves([{'text':'x'*61,'source':'jd'}])
+ with pytest.raises(ValueError):js.checked_must_haves([{'text':f'条件{i}','source':'jd'} for i in range(11)])
+ with pytest.raises(ValueError):js.checked_must_haves([{'text':'a','source':'other'}])
+ with pytest.raises(ValueError):js.checked_must_haves([{'text':'a','source':'jd','note':'n'*121}])
+
+def test_must_haves_reject_duplicate_ids(): # 11-27 评审：不同文字共用同一标识，初筛结论会对错条
+ with pytest.raises(ValueError,match='岗位必须项标识重复'):js.checked_must_haves([{'id':'mh_1','text':'甲','source':'jd'},{'id':'mh_1','text':'乙','source':'jd'}])
+ assert len(js.checked_must_haves([{'id':'mh_1','text':'甲','source':'jd'},{'id':'mh_1','text':'甲','source':'jd'}]))==1
+
+def test_revision_ignores_note_and_order():
+ a=[{'id':'mh_1','text':'甲','source':'jd','note':'x'},{'id':'mh_2','text':'乙','source':'jd'}]
+ b=[{'id':'mh_2','text':'乙','source':'jd'},{'id':'mh_1','text':'甲','source':'jd','note':'y'}]
+ assert js.must_haves_revision(a)==js.must_haves_revision(b)!=js.must_haves_revision(a[:1])
+ assert js.must_haves_revision([])==''
+
+def test_apply_and_resolve_carry_must_haves():
+ case={'job':{'label':'研发岗位'}};p={'greeting':'您好','outreach_terms':[],'recommend_filters':[],'must_haves':[{'text':'有分布式经验','source':'jd'}]}
+ js.apply(case,p);assert case['job_sourcing']['must_haves'][0]['text']=='有分布式经验'
+ assert js.resolve(case)['must_haves']==case['job_sourcing']['must_haves']
 
 @pytest.mark.parametrize('agent',['planner','executor'])
 async def test_agent_job_patch_is_scoped_partial_and_only_changes_draft(jobs,monkeypatch,agent):

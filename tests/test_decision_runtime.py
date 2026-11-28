@@ -435,7 +435,8 @@ def _first_contact_env(env,monkeypatch,count,choose,closes=False,list_ok=True):
  seen={'lists':0,'profiles':[],'proposals':[]}
  async def ensure(*a):return True
  async def open_list(session,case):seen['lists']+=1;return copy.deepcopy(cards)
- async def open_profile(session,geek_id,*a,**kw):seen['profiles'].append(geek_id)
+ async def open_profile(session,geek_id,*a,**kw):
+  seen['profiles'].append(geek_id);session._boss_recommend_detail={'page':None,'geek_id':geek_id,'overview':'工作经历概览 '+geek_id}
  async def propose(manager,case,person,plan,actions,answer,labels,feedback):
   geek=person['profile']['geek_id'];seen['proposals'].append(geek)
   return {'action':choose(geek),'reason':'依据职业线索判断','fact_index':-1},{},{}
@@ -541,6 +542,162 @@ async def test_first_contact_profile_change_sets_aside_only_that_candidate(env,m
   assert 'boss-geek:g0' not in latest['candidates']
 
 
+def _screening_env(env,monkeypatch,count,verdict,choose=lambda geek:'contact',**kw):
+ # 首聊前初筛：岗位配置必须项，screen 用替身；verdict(geek) 返回 'pass'／'reject'，或抛 ScreeningUnavailable。
+ import cloakup.screening as sc
+ from cloakup.job_sourcing import must_haves_revision
+ m,c,seen=_first_contact_env(env,monkeypatch,count,choose,**kw)
+ must=[{'id':'mh1','text':'有团队管理经验','source':'jd','note':'','added_at':1.0}]
+ c['job_sourcing']={**(c.get('job_sourcing') or {}),'must_haves':must};m.cases.save(c)
+ async def screen(manager,case,person,overview,*,llm=None):
+  geek=person['profile']['geek_id'];seen['screens']=seen.get('screens',0)+1;seen.setdefault('overviews',[]).append(overview)
+  outcome=verdict(geek)
+  rev=must_haves_revision((case.get('job_sourcing') or {}).get('must_haves') or [])
+  return {'revision':rev,'at':time.time(),'items':[{'id':'mh1','verdict':'unmet' if outcome=='reject' else 'met','evidence':'资料未提及'}],
+          'outcome':outcome,'unclear_ids':[],'model':'stub'}
+ monkeypatch.setattr(sc,'screen',screen)
+ return m,c,seen
+
+
+async def test_no_must_haves_no_model_call(env,monkeypatch):
+ # 岗位没有必须项：行为与今天一致，不调用初筛模型；打开过的资料照常记审阅时间（计入当天打开资料上限）。
+ import cloakup.autopilot as ap,cloakup.screening as sc
+ m,c,seen=_first_contact_env(env,monkeypatch,2,lambda geek:'contact')
+ async def screen(*a,**kw):seen['screens']=seen.get('screens',0)+1
+ monkeypatch.setattr(sc,'screen',screen)
+ with pytest.raises(_Contacted) as contacted:
+  await ap.first_contact(m,{'account_runner':True},NS(),c)
+ assert str(contacted.value)=='g0' and seen.get('screens',0)==0
+ person=m.cases.load(c['id'])['candidates']['boss-geek:g0']
+ assert 'screening' not in person and time.time()-60<person['profile_reviewed_at']<=time.time()
+
+
+async def test_unmet_skips_and_continues_to_next_card(env,monkeypatch):
+ # g0 不符合必须项：不开聊、不问 Harness，关弹层接着看下一张；g1 通过后照常联系。
+ import cloakup.autopilot as ap
+ m,c,seen=_screening_env(env,monkeypatch,3,lambda geek:'reject' if geek=='g0' else 'pass',closes=True)
+ with pytest.raises(_Contacted) as contacted:
+  await ap.first_contact(m,{'account_runner':True},NS(),c)
+ assert str(contacted.value)=='g1' and seen['proposals']==['g1']
+ assert seen['overviews']==['工作经历概览 g0','工作经历概览 g1'] and seen['closes']==1 and seen['lists']==1
+ assert len(seen['pauses'])==1 and 2.5<=seen['pauses'][0]<=25
+ saved=m.cases.load(c['id']);p=saved['candidates']['boss-geek:g0']
+ assert p['screening']['outcome']=='reject' and not p['outbox']
+ assert saved['candidates']['boss-geek:g1']['screening']['outcome']=='pass'
+ audit=[e for e in saved['audit'] if e['kind']=='precontact_screening']
+ assert [(e['candidate_id'],e['details']['outcome']) for e in audit]==[('boss-geek:g0','reject')]
+
+
+async def test_rejected_not_reopened_same_revision(env,monkeypatch):
+ import cloakup.autopilot as ap
+ m,c,seen=_screening_env(env,monkeypatch,2,lambda geek:'reject' if geek=='g0' else 'pass',closes=True)
+ with pytest.raises(_Contacted):await ap.first_contact(m,{'account_runner':True},NS(),m.cases.load(c['id']))
+ seen['profiles'].clear()
+ with pytest.raises(_Contacted) as contacted:await ap.first_contact(m,{'account_runner':True},NS(),m.cases.load(c['id']))
+ assert str(contacted.value)=='g1' and seen['profiles']==['g1'] and seen['screens']==3
+
+
+async def test_rejected_person_rescreened_after_revision_change(env,monkeypatch):
+ # 必须项改了（版本变化）：之前被拒的人重新打开、重新初筛。
+ import cloakup.autopilot as ap
+ verdicts={'g0':'reject'}
+ m,c,seen=_screening_env(env,monkeypatch,1,lambda geek:verdicts[geek],closes=True)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),m.cases.load(c['id']))=='screened_out'
+ case=m.cases.load(c['id']);case['job_sourcing']['must_haves'][0]['text']='有项目交付经验';m.cases.save(case)
+ verdicts['g0']='pass';seen['profiles'].clear()
+ with pytest.raises(_Contacted) as contacted:await ap.first_contact(m,{'account_runner':True},NS(),m.cases.load(c['id']))
+ assert str(contacted.value)=='g0' and seen['profiles']==['g0'] and seen['screens']==2
+
+
+async def test_all_reviewed_rejected_returns_screened_out(env,monkeypatch):
+ import cloakup.autopilot as ap
+ m,c,seen=_screening_env(env,monkeypatch,3,lambda geek:'reject',closes=True)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='screened_out'
+ assert seen['profiles']==['g0','g1','g2'] and seen['proposals']==[]
+ # 审阅上限内全部被拒，同样让位；有人被 Harness 暂不联系（不是初筛拒绝）则保持原返回值。
+ m,c,seen=_screening_env(env,monkeypatch,10,lambda geek:'reject',closes=True)
+ monkeypatch.setattr(ap,'FIRST_CONTACT_REVIEWS_PER_BATCH',(3,3))
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='screened_out' and len(seen['profiles'])==3
+ m,c,seen=_screening_env(env,monkeypatch,3,lambda geek:'reject' if geek!='g1' else 'pass',lambda geek:'wait',closes=True)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='no_candidates'
+
+
+async def test_screening_failure_sets_aside_only_that_person(env,monkeypatch):
+ # g0 初筛暂不可用：只放下 g0 约 30 分钟（不当作不符合），g1 照常联系；失败次数记在执行器记录上。
+ import cloakup.autopilot as ap
+ from cloakup.screening import ScreeningUnavailable
+ from cloakup.autonomy import day_key
+ def verdict(geek):
+  if geek=='g0':raise ScreeningUnavailable('模型初筛暂不可用或输出不合格')
+  return 'pass'
+ m,c,seen=_screening_env(env,monkeypatch,3,verdict,closes=True)
+ persisted=[];m.persist=lambda job:persisted.append(1)
+ job={'account_runner':True};now=time.time()
+ with pytest.raises(_Contacted) as contacted:await ap.first_contact(m,job,NS(),c)
+ assert str(contacted.value)=='g1' and seen['proposals']==['g1']
+ p=m.cases.load(c['id'])['candidates']['boss-geek:g0']
+ assert now<p['decision_wait_until']<=time.time()+1800*1.8 and 'screening' not in p and not p['outbox']
+ record=job['screening_failures'][day_key()][c['id']]
+ assert record['n']==0 and record['last_failed_at']>=now and record['last_ok_at']>=record['last_failed_at'] and persisted  # g1 成功后连续失败次数清零
+ assert record['reason']=='模型初筛暂不可用或输出不合格'  # 11-27：最近一次失败原因随记录保存，待办里显示
+
+
+async def test_profile_view_cap_blocks_before_opening(env,monkeypatch):
+ # 当天打开资料到上限：不再进入推荐页（不做话术核验、不打开列表），返回 views_exhausted；“到上限”事件当天每个岗位只发一次。
+ import cloakup.autopilot as ap
+ m,c,seen=_first_contact_env(env,monkeypatch,2,lambda geek:'contact')
+ task={'id':'t1','config':{'execution':{'daily_new_limit':20}}}
+ events=[];m.event=lambda job,kind,msg:events.append(msg)
+ monkeypatch.setattr(ap,'effective_task',lambda db,cid:task)
+ monkeypatch.setattr(ap.job_quota,'allowed',lambda *a:True)
+ monkeypatch.setattr(ap.job_quota,'views_remaining',lambda *a:0)
+ job={'account_runner':True}
+ assert await ap.first_contact(m,job,NS(),c)=='views_exhausted' and await ap.first_contact(m,job,NS(),c)=='views_exhausted'
+ assert seen['lists']==0 and seen['profiles']==[] and events.count('今天打开资料已到上限，本岗位今天不再审阅推荐')==1
+
+
+async def test_profile_view_cap_reached_mid_batch_and_counted_once_per_call(env,monkeypatch):
+ # 额度在本次调用开始时算一次、按打开递减：剩 1 份时打开 g0（暂不联系）后不再打开 g1。
+ import cloakup.autopilot as ap
+ m,c,seen=_first_contact_env(env,monkeypatch,3,lambda geek:'wait',closes=True)
+ task={'id':'t1','config':{'execution':{'daily_new_limit':20}}};calls=[]
+ monkeypatch.setattr(ap,'effective_task',lambda db,cid:task)
+ monkeypatch.setattr(ap.job_quota,'allowed',lambda *a:True)
+ monkeypatch.setattr(ap.job_quota,'views_remaining',lambda *a:calls.append(1) or 1)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='views_exhausted'
+ assert seen['profiles']==['g0'] and len(calls)==1
+
+
+async def test_screening_outage_yields_job_without_burning_views(env,monkeypatch):
+ # 初筛全部失败（或失败加拒绝）：返回 screened_out（约 30 分钟让位），不当作今天没人可联系；失败的人不记审阅时间。
+ import cloakup.autopilot as ap
+ from cloakup.screening import ScreeningUnavailable
+ def down(geek):raise ScreeningUnavailable('模型初筛暂不可用或输出不合格')
+ m,c,seen=_screening_env(env,monkeypatch,2,down,closes=True)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='screened_out'
+ people=m.cases.load(c['id'])['candidates']
+ assert seen['profiles']==['g0','g1'] and all('profile_reviewed_at' not in people[k] for k in people if k.startswith('boss-geek:'))
+ def mixed(geek):
+  if geek=='g0':raise ScreeningUnavailable('模型初筛暂不可用或输出不合格')
+  return 'reject'
+ m,c,seen=_screening_env(env,monkeypatch,2,mixed,closes=True)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='screened_out'
+ assert 'profile_reviewed_at' in m.cases.load(c['id'])['candidates']['boss-geek:g1']
+
+
+async def test_reject_event_without_matching_must_have_has_no_empty_brackets(env,monkeypatch):
+ import cloakup.autopilot as ap,cloakup.screening as sc
+ m,c,seen=_screening_env(env,monkeypatch,1,lambda geek:'reject',closes=True)
+ events=[];m.event=lambda job,kind,msg:events.append(msg)
+ async def screen(manager,case,person,overview,*,llm=None):
+  from cloakup.job_sourcing import must_haves_revision
+  return {'revision':must_haves_revision(case['job_sourcing']['must_haves']),'at':time.time(),'items':[{'id':'other','verdict':'unmet','evidence':''}],
+          'outcome':'reject','unclear_ids':[],'model':'stub'}
+ monkeypatch.setattr(sc,'screen',screen)
+ assert await ap.first_contact(m,{'account_runner':True},NS(),c)=='screened_out'
+ assert any(e.endswith('不符合本岗位必须项，不开聊，继续查看下一张推荐卡片') for e in events) and not any('（）' in e for e in events)
+
+
 def _privacy_world(env,monkeypatch):
  m,c,p,plan,snap,controls=env
  import cloakup.conversation_semantics as cs
@@ -636,3 +793,23 @@ async def test_set_aside_new_candidate_is_skipped_by_the_next_batch(env,monkeypa
  assert seen['profiles']==['g0']
  await ap.first_contact(m,{'account_runner':True},session,m.cases.load(c['id']))
  assert seen['profiles'][1]=='g1' and seen['profiles'].count('g0')==1
+
+
+def test_first_contact_payload_carries_screening_summary(env):
+ # 11-27 首聊前置初筛：决策载荷只带初筛结论与待定条数，不带必须项文字与证据；无必须项时 passed 为 None。
+ from cloakup.job_sourcing import must_haves_revision
+ m,c,p,plan,snap,controls=env
+ acts={'contact':'按已核实的岗位话术发起一次主动联系','wait':'本轮不新增联系'};ans={'action':'continue','source':'conversation'}
+ first=dr.payload(c,p,plan,acts,ans,[],[])
+ assert first['first_contact_checks']['screening']=={'passed':None,'unclear_count':0}
+ assert '程序已按本岗位必须项初筛通过（passed 为 null 表示本岗位未设必须项）' in first['first_contact_checks']['note']
+ assert '本岗位职业关键词相关的经历线索时应联系' not in first['first_contact_checks']['note']
+ must=[{'id':'mh_a','text':'有独立交付候选人经验','note':'客户原话甲'},{'id':'mh_b','text':'熟悉制造业招聘','note':'客户原话乙'}]
+ c['job_sourcing']={**(c.get('job_sourcing') or {}),'must_haves':must}
+ p['screening']={'revision':must_haves_revision(must),'at':time.time(),'items':[{'id':'mh_a','verdict':'met','evidence':'证据文字甲'},{'id':'mh_b','verdict':'unclear','evidence':'证据文字乙'}],'outcome':'pass','unclear_ids':['mh_b'],'model':'m'}
+ first=dr.payload(c,p,plan,acts,ans,[],[])
+ assert first['first_contact_checks']['screening']=={'passed':True,'unclear_count':1}
+ wire=json.dumps(first,ensure_ascii=False)
+ for value in ('有独立交付候选人经验','熟悉制造业招聘','客户原话','证据文字','mh_a','mh_b'):assert value not in wire
+ p['screening']={**p['screening'],'revision':'stale'}
+ assert dr.payload(c,p,plan,acts,ans,[],[])['first_contact_checks']['screening']=={'passed':None,'unclear_count':0}

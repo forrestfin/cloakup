@@ -10,17 +10,20 @@ from . import job_members
 from .autonomy import day_key
 
 ACCOUNT_DAILY_CAP=20
+# 每账号每天最多打开的推荐资料数（首聊前审阅）；任务配置 execution.profile_view_cap 只能更严。
+PROFILE_VIEW_CAP=80
 
 
 def attempted_on(m:dict,day:str,intent:str|None=None)->bool:
     """这条消息是否算作 day 当天的一次占位。"""
     if intent and m.get('intent')!=intent:return False
+    if m.get('abort_reason'):return False  # 点发送前中止，一定没发出
     if m.get('claimed_at'):return day_key(m['claimed_at'])==day
     return m.get('origin')=='external_observed' and m.get('intent')=='first_contact' and str(m.get('receipt',{}).get('platform_time','')).startswith(day)
 
 
 def task_target(task_id:str,limit:int,day:str)->int:
-    """任务当天首聊目标：等于管理员配置的上限（11-25 管理员：每天要把首聊额度用完，不再按 75%～100% 打折）。"""
+    """任务当天首聊目标：等于管理员配置的上限，是上限不是目标：初筛不过宁可不开聊（2026-11-27 管理员：宁缺毋滥）。"""
     return max(0,limit)
 
 
@@ -73,6 +76,32 @@ def allowed(store,task:dict,case_id:str,day:str)->bool:
     usage=usage_by_case(store,counted_case_ids(cfg,day),day)
     limit=cfg.get('execution',{}).get('daily_new_limit',0)
     return pick_case(task['id'],limit,weights,usage,set(weights)-{case_id},day)==case_id
+
+
+def views_by_case(store,case_ids:list[str]|None,day:str)->dict[str,int]:
+    """当天打开过资料的候选人数（按 profile_reviewed_at 落在当天计数）；case_ids 为 None 时统计账号下全部岗位。"""
+    views={cid:0 for cid in case_ids} if case_ids is not None else {}
+    for case in store.list():
+        if case_ids is not None and case['id'] not in views:continue
+        views[case['id']]=views.get(case['id'],0)+sum(isinstance(c.get('profile_reviewed_at'),(int,float)) and day_key(c['profile_reviewed_at'])==day for c in case['candidates'].values())
+    return views
+
+
+def views_remaining(store,task:dict,case_id:str,day:str)->int:
+    """该岗位当天还能打开几份推荐资料：账号当天合计不超过上限，且本岗位不超过按权重分得的份额。
+
+    上限为 PROFILE_VIEW_CAP，任务配置 execution.profile_view_cap 更小时取配置（只能更严）。
+    """
+    cfg=copy.deepcopy(task['config']);job_members.normalize(cfg);weights=job_members.weights(cfg)
+    if case_id not in weights:return 0
+    configured=cfg.get('execution',{}).get('profile_view_cap')
+    cap=min(configured,PROFILE_VIEW_CAP) if isinstance(configured,int) and not isinstance(configured,bool) and configured>=0 else PROFILE_VIEW_CAP
+    views=views_by_case(store,None,day)
+    return max(0,min(cap-sum(views.values()),allocate(cap,weights)[case_id]-views.get(case_id,0)))
+
+
+def views_allowed(store,task:dict,case_id:str,day:str)->bool:
+    return views_remaining(store,task,case_id,day)>0
 
 
 def task_quota(store,task:dict,day:str,*,usage:dict[str,int]|None=None,account_used:int|None=None)->dict:

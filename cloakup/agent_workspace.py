@@ -73,7 +73,7 @@ def source_digest(case):
 def runtime_files():
     """执行文件哈希，每个进程只算一次：运行中的进程执行的就是启动时加载的代码，换代码必然重启。"""
     directory=Path(__file__).parent
-    return {name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in ('agent_workspace.py','conversation_semantics.py','decision_runtime.py','autonomy.py','communication_policy.py','action_gateway.py','workbench.py','task_policy.py','account_execution.py','facts.py','faq.py','task_planning.py','prompts.py','browser.py','boss_chat.py','autopilot.py','selection_recovery.py','browser_diagnostics.py','dom_reader.py','executor_check.py','platform.py','scenario_workspace.py','harness_runtime.py','greeting_policy.py','frame_actions.py','boss_contact.py','boss_recommend.py','job_sourcing.py')}
+    return {name:hashlib.sha256((directory/name).read_bytes()).hexdigest() for name in ('agent_workspace.py','conversation_semantics.py','decision_runtime.py','autonomy.py','communication_policy.py','action_gateway.py','workbench.py','task_policy.py','account_execution.py','facts.py','faq.py','task_planning.py','prompts.py','browser.py','boss_chat.py','autopilot.py','selection_recovery.py','browser_diagnostics.py','dom_reader.py','executor_check.py','platform.py','scenario_workspace.py','harness_runtime.py','greeting_policy.py','frame_actions.py','boss_contact.py','boss_recommend.py','job_sourcing.py','screening.py','job_quota.py')}
 
 
 def runtime_inputs():

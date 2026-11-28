@@ -16,6 +16,7 @@
 - `cloakup/decision_runtime.py`：每个会话的动作准入（`capabilities`）、程序直办（`direct_proposal`）、Harness 决策与暂缓（`hold`）
 - `cloakup/answering.py`、`faq.py`、`facts.py`：静态答复路由；岗位依据分两处：已确认事实 + 岗位 FAQ（管理员补答进 FAQ）
 - `cloakup/conversation_semantics.py`：对话理解与脱敏 `redact`；`followup.py`：追聊与体验底线；`resume_closure.py`：收简历致谢
+- `cloakup/screening.py`：首聊前初筛，脱敏资料逐条对照岗位必须项（符合／不符合／看不出），明确不符合就不开聊
 - `cloakup/attention.py`：管理员待办（由真实状态推导，`reconcile`）；`agent_workspace.py`：草案、隔离验收、发布与签名
 - `cloakup/workbench.py`：HTTP 服务、任务管理、重启恢复；`boss_*.py`：BOSS 页面适配；`logbook.py`：结构化日志
 - `tests/test_<模块>.py`：与模块一一对应
@@ -27,8 +28,8 @@
 3. **发送先占位**：写平台的动作先在 `operations`／`action_leases` 占位。
 4. **恢复轮次只读**（`autopilot.recovery_pass`），只允许同意接收候选人主动发起的简历。
 5. **单条问题不停整单**：只有页面级问题（登录失效、平台验证、未发送草稿、页面换了）才暂停任务。
-6. **发布走草案与隔离验收**：运行中的任务不直接换版本；例外是 `faq_answers.apply` 与 `job_changes.apply` 在安全点换绑，新岗位须先通过本岗位的隔离验收。
-7. **候选人身份不进模型**：`redact` 隐去姓名、称呼、联系方式、证件／平台标识、年龄性别、附件文件名；单位、学校、城市保留；只隐去、不整段拒绝（2026-11-24 管理员确认）。Harness 决策载荷只含意图标签与资料状态。
+6. **发布走草案与隔离验收**：运行中的任务不直接换版本；例外是 `faq_answers.apply`、`job_changes.apply` 与 `job_changes` 的 `must_haves`（必须项）在安全点换绑，新岗位和必须项改动须先通过本岗位的隔离验收（必须项 2026-11-27 管理员决定）。
+7. **候选人身份不进模型**：`redact` 隐去姓名、称呼、联系方式、证件／平台标识、年龄性别、附件文件名；单位、学校、城市保留；只隐去、不整段拒绝（2026-11-24 管理员确认）。Harness 决策载荷只含意图标签与资料状态（首聊前初筛另加 `screening.passed`／`unclear_count`）。首聊前初筛（`screening.py`）把经 `redact` 脱敏的资料正文送模型，是独立调用、不进 Harness 载荷，不另设授权记录（2026-11-27 管理员确认）。
 8. **岗位信息只作为参数**：代码、正则、提示词里不写死任何岗位或行业的词。
 9. **不让候选人不适**：追聊受 `followup.py` 顶部底线约束（无回复者最多 1 次、回复后沉默最多 2 次、未读不追、已读后 ≥72 小时、只在 9–20 点），配置只能更严。
 10. **薪酬不报数字**：只说已确认的结构，数字类追问回“进一步详聊”（`communication_policy.SALARY_POLICY`）。
@@ -62,11 +63,11 @@
 - 不手工改线上数据库里的候选人记录来“修数据”；用代码里的幂等恢复逻辑在执行器安全点处理。
 
 ## 补充说明
-- **发布签名**：`agent_workspace.signature` 含约 28 个执行文件的哈希。改了这些文件，重建后已发布版本失效，自动恢复会失败（`auto_resume_failed:release_changed`，并生成待办）。上线流程：重建 → `POST /api/tasks/<id>/agent-workspace/draft` → `.../test`（mode=validate，9 个场景）→ `.../publish` → `POST /api/account-tasks/<id> {"action":"resume"}`，写请求带 `X-Cloakup-Token`（取自 `/api/state`）。多个改动尽量合并一次上线。
+- **发布签名**：`agent_workspace.signature` 含 30 个执行文件的哈希。改了这些文件，重建后已发布版本失效，自动恢复会失败（`auto_resume_failed:release_changed`，并生成待办）。上线流程：重建 → `POST /api/tasks/<id>/agent-workspace/draft` → `.../test`（mode=validate，9 个场景）→ `.../publish` → `POST /api/account-tasks/<id> {"action":"resume"}`，写请求带 `X-Cloakup-Token`（取自 `/api/state`）。多个改动尽量合并一次上线。
 - **容器内读线上数据**：`DATABASE_URL` 只在入口进程里设置；脚本要自己用 `/run/secrets/postgres_password` 组装，否则会连到 `/data/data/cloakup.db` 旧 SQLite（空）。脚本放 `.tmp_incident/`，`docker compose cp` 进容器运行。
 - **只读演练**：把本地 `cloakup/` 拷到容器 `/tmp/newpkg`（`chmod -R a+rX`），脚本里 `sys.path.insert(0,'/tmp/newpkg')`，对线上数据只读计算谁会收到什么。
 - **核对“系统没回答”**：已确认事实和岗位 FAQ 两处都要查；“确认收到、等待核实”不是回答（`decision_runtime.answer_sent`）。
-- **执行时段**：任务有自己的时段（目前 9:00–12:00、13:30–23:30），时段外不操作网站；追聊另受 9–20 点限制。
+- **执行时段**：任务有自己的时段（目前 9:00–12:00、13:30–23:30），时段外不操作网站；追聊另受 9–20 点限制。每天首聊额度是上限不是目标（2026-11-27 管理员：宁缺毋滥）；账号每天最多打开 80 份推荐资料，按岗位权重分。
 - **沟通页卡在“加载中”**：`boss_chat.open_menu` 会有冷却地重新打开一次；仍不行再用 noVNC（`127.0.0.1:6080`，默认 `view_only=1`）查看。
 - 用户说“看一下日志”时，读 `data/logs/`、`data/reports/`，结论写到 `data/analysis/<日期>-<时>.md`。
 - 待办：拆分 `run_account_executor`、`sync_and_follow` 等超大函数；日报可选飞书摘要、日报页面、读取 operations／action_leases；候选人 30 的“上班时间”作息尚无 FAQ。

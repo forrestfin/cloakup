@@ -29,7 +29,7 @@ IDENTITY_READER_JS = r'''(title,chatId=null,expectedName=null)=>{
  const renderedText=root=>{const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);let s='';for(let n=w.nextNode();n;n=w.nextNode()){const p=n.parentElement;if(!p||getComputedStyle(p).visibility==='hidden')continue;const r=document.createRange();r.selectNodeContents(n);if(r.getClientRects().length)s+=n.textContent;}return norm(s)};
  const rows=Array.from(document.querySelectorAll('.geek-item[data-id]:not(.group-item)')).filter(visible).filter(e=>/^[1-9]\d*-\d+$/.test(e.getAttribute('data-id')||''));
  const selected=rows.filter(r=>r.classList.contains('selected'));
- const evidence={selected_rows:selected.length,visible_rows:rows.length,header_candidates:0,job_matched:0,name_matched:0,target_row_present:!chatId||rows.some(r=>r.getAttribute('data-id')===chatId)};
+ const evidence={selected_rows:selected.length,visible_rows:rows.length,header_candidates:0,job_matched:0,name_matched:0,header_jobs:[],target_row_present:!chatId||rows.some(r=>r.getAttribute('data-id')===chatId)};
  if(selected.length>1)return {valid:false,reason_code:'selected_row_ambiguous',evidence};
  if(chatId&&selected.length===1&&selected[0].getAttribute('data-id')!==chatId)return {valid:false,reason_code:'selected_target_mismatch',evidence};
  const candidates=selected.length===1?selected:rows;
@@ -41,6 +41,8 @@ IDENTITY_READER_JS = r'''(title,chatId=null,expectedName=null)=>{
   if(!visible(e)||!(e.innerText||'').includes('在线简历'))continue;
   if(headers.has(e))continue;headers.add(e);evidence.header_candidates++;
   const values=fields(e),job=values.some(v=>v.replace(/^沟通职位[：:]?/,'')===norm(title));
+  // 诊断用：头部“沟通职位”实际写的是什么（同一字段或紧随其后的字段），最多 3 条、每条 40 字。
+  values.forEach((v,i)=>{if(!/^沟通职位/.test(v))return;const shown=(v.replace(/^沟通职位[：:]?/,'')||values[i+1]||'').slice(0,40);if(shown&&evidence.header_jobs.length<3&&!evidence.header_jobs.includes(shown))evidence.header_jobs.push(shown)});
   if(!job)continue;evidence.job_matched++;
   // A display name may be composed of multiple inline text spans.
   // Accept the entire name element only, never a substring of the header.
@@ -202,6 +204,12 @@ class ChatSelectionUnavailable(SourcingError):
     def __init__(self,message,*,stage='selection',reason='unavailable',exception_type=None):
         super().__init__(message)
         self.diagnostics={'stage':stage,'reason':reason,'exception_type':exception_type}
+
+
+def _note_header_jobs(error, evidence):
+    """头部“沟通职位”实际显示的文字写进诊断，只取这个字段，便于查岗位名为什么对不上。"""
+    jobs=[str(v)[:40] for v in ((evidence or {}).get('header_jobs') or [])][:3] if isinstance(evidence,dict) else []
+    if jobs:error.diagnostics['header_jobs']=jobs
 
 
 def _selection_page(session):
@@ -564,7 +572,9 @@ async def open_conversation(session, chat_id, receiver, job_title):
             await asyncio.sleep(lognormal(0.8, 0.4, 0.35, 2.5) if click_index else .6)
         if snapshot.get('reason_code') not in ('detail_not_open','header_job_unverified'):
             break
-    raise ChatSelectionUnavailable('打开后的会话头部身份未核实，未发送',stage='verify_identity',reason=snapshot.get('reason_code','header_identity_unverified'))
+    error=ChatSelectionUnavailable('打开后的会话头部身份未核实，未发送',stage='verify_identity',reason=snapshot.get('reason_code','header_identity_unverified'))
+    _note_header_jobs(error,snapshot.get('evidence'))
+    raise error
 
 
 async def current_identity(session, job_title, *, page=None, chat_id=None):
@@ -595,6 +605,7 @@ async def inspect_row(session, row, job_title):
     reason=probe.get('reason_code') or 'header_identity_unverified'
     error=ChatSelectionUnavailable('历史会话的收件人或岗位尚未核实，未发送',stage='verify_identity',reason=reason)
     error.diagnostics['identity_evidence']=probe
+    _note_header_jobs(error,probe.get('evidence'))
     raise error
 
 
@@ -602,7 +613,9 @@ async def read_conversation(session, chat_id, receiver, job_title, *, required=T
     expr = SNAPSHOT_JS.replace('IDENTITY_READER',IDENTITY_READER_JS).replace('STATUS_FUNCTION',MESSAGE_STATUS_JS).replace('CHAT_ID',json.dumps(chat_id)).replace('EXPECTED_NAME',json.dumps(receiver)).replace('EXPECTED_TITLE',json.dumps(job_title))
     data = await _bound_read(page,expr) if page is not None else await evaluate(session, expr)
     if required and not data.get('valid'):
-        raise ChatSelectionUnavailable(data.get('reason','会话未核实'),stage='verify_identity',reason=data.get('reason_code','header_identity_unverified'))
+        error=ChatSelectionUnavailable(data.get('reason','会话未核实'),stage='verify_identity',reason=data.get('reason_code','header_identity_unverified'))
+        _note_header_jobs(error,data.get('evidence'))
+        raise error
     if data.get('valid'):
         if not data.get('messages') and required:
             raise ChatSelectionUnavailable('尚未识别真实消息列表，停止自动沟通，需适配当前页面',stage='read_messages',reason='message_list_unavailable')
@@ -615,12 +628,34 @@ async def read_conversation(session, chat_id, receiver, job_title, *, required=T
     return data
 
 
+class SendAborted(SourcingError):
+    """点击“发送”之前中止：消息一定没发出去。typed=已打字，cleared=自己打的字已删掉。"""
+
+    def __init__(self, message, *, reason, typed, cleared):
+        super().__init__(message)
+        self.reason, self.typed, self.cleared = reason, typed, cleared
+
+
+async def _clear_own_text(session, binding, text, editor):
+    """只删自己刚打、与正文逐字一致的文字；删不掉或内容不一致都返回 False，不抛异常。"""
+    try:
+        now = await read_conversation(session, binding['chat_id'], binding['receiver'], binding['job_title'], required=False)
+        if now.get('editor_value') != text:return False
+        # 任务刚暂停时 _act 会拒绝页面操作；删自己刚打的字走 _tidy（只在管理员接管时拒绝），否则留下的字恢复后又会暂停任务。
+        act = getattr(session, '_tidy', None) or session._act
+        await act('type', lambda: editor.fill('', timeout=20000))
+        after = await read_conversation(session, binding['chat_id'], binding['receiver'], binding['job_title'], required=False)
+        return after.get('editor_value', None) == ''
+    except Exception:
+        return False
+
+
 async def send_once(session, binding, text, before, *, pre_send=None):
     now = await read_conversation(session, binding['chat_id'], binding['receiver'], binding['job_title'])
     if now['fingerprint'] != before['fingerprint'] or now['editor_count'] != 1:
-        raise SourcingError('阅读后会话变化或输入框不唯一，未发送')
+        raise SendAborted('阅读后会话变化或输入框不唯一，未发送', reason='changed_before_typing', typed=False, cleared=False)
     if now.get('editor_value','').strip():
-        raise SourcingError('输入框已有人工草稿，自动沟通未覆盖')
+        raise SendAborted('输入框已有人工草稿，自动沟通未覆盖', reason='existing_draft', typed=False, cleared=False)
     obs = await _observation(session)
     editors = [e for e in obs.elements if e.raw.get('editable') or e.raw.get('contenteditable') or e.tag=='textarea' or e.raw.get('role')=='textbox']
     # Observation CSS must resolve to the single actual contenteditable input.
@@ -629,24 +664,38 @@ async def send_once(session, binding, text, before, *, pre_send=None):
         # the DOM control directly but still use the humanized locator API.
         editor = session.page.locator('[contenteditable="true"]')
         if await editor.count() != 1:
-            raise SourcingError('无法核实唯一会话输入框')
+            raise SendAborted('无法核实唯一会话输入框', reason='editor_unavailable', typed=False, cleared=False)
         value = await editor.inner_text()
-        if value.strip():raise SourcingError('输入框已有人工草稿，自动沟通未覆盖')
+        if value.strip():raise SendAborted('输入框已有人工草稿，自动沟通未覆盖', reason='existing_draft', typed=False, cleared=False)
         await session._act('type',lambda:editor.fill(text,timeout=20000))
     else:
-        if editors[0].raw.get('value','').strip():raise SourcingError('输入框已有人工草稿，未覆盖')
+        if editors[0].raw.get('value','').strip():raise SendAborted('输入框已有人工草稿，未覆盖', reason='existing_draft', typed=False, cleared=False)
+        editor = session.element(editors[0].index)[0]
         await session.type_text(editors[0].index,text,clear=True,submit=False)
+
+    async def abort(message, reason):
+        # 11-27 10:28：中止时把自己打的字留在框里，15 分钟后被当成人工草稿，整单停了 5 小时。
+        cleared = await _clear_own_text(session, binding, text, editor)
+        raise SendAborted(message + ('；已删除未发送的文字' if cleared else '；未能删除输入框里的文字'), reason=reason, typed=True, cleared=cleared)
     # Recheck messages after typing; an intervening reply revokes this send.
-    fresh = await read_conversation(session,binding['chat_id'],binding['receiver'],binding['job_title'])
+    try:
+        fresh = await read_conversation(session,binding['chat_id'],binding['receiver'],binding['job_title'])
+    except Exception as exc:
+        await abort('输入后读取会话失败（'+type(exc).__name__+'），未点击发送', 'reread_failed')
     if fresh['fingerprint'] != before['fingerprint']:
-        raise SourcingError('输入期间收到新消息，保留草稿并停止本次发送')
+        await abort('输入期间收到新消息，停止本次发送', 'reply_during_typing')
     if fresh.get('editor_value') != text:
-        raise SourcingError('输入后的正文与本次消息不一致，未点击发送')
-    obs = await _observation(session)
+        await abort('输入后的正文与本次消息不一致，未点击发送', 'text_mismatch')
+    try:
+        obs = await _observation(session)
+    except Exception as exc:
+        await abort('输入后读取页面失败（'+type(exc).__name__+'），未点击发送', 'reread_failed')
     buttons = [e for e in obs.elements if e.label=='发送' and not e.raw.get('disabled') and not e.raw.get('frame_url')]
-    if len(buttons) != 1:raise SourcingError('发送按钮不唯一')
+    if len(buttons) != 1:await abort('发送按钮不唯一', 'send_button_not_unique')
     # The caller durably claims before calling this method. No retry after click.
-    if pre_send:pre_send()
+    if pre_send:
+        try:pre_send()
+        except SourcingError as exc:await abort(str(exc), 'not_authorized')
     await session.click(buttons[0].index)
     prior = {m['external_id'] for m in before['messages']}
     for _ in range(8):

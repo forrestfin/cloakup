@@ -372,3 +372,91 @@ async def test_not_reaching_the_bottom_keeps_retrying(inbox,monkeypatch):
         await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
     case=inbox.store.load(inbox.case['id'])
     assert case['deferred_chat_ids']==['12-0'] and not case.get('missing_chat_ids')
+
+
+def _withdrawn(inbox,monkeypatch,withdrawn=True):
+    # 11-27 旧 QE 岗位撤下后，约 7 条旧会话认不出，放下后每约 15 分钟复核一次、次次失败。
+    logged=_deferred(inbox,monkeypatch)
+    monkeypatch.setattr(ap,'withdrawn_case',lambda manager,case_id:withdrawn)
+    checks=[]
+    async def open_chat(session,**binding):
+        checks.append(binding['chat_id'])
+        raise boss_chat.ChatSelectionUnavailable('详情头部未匹配目标岗位',stage='verify_identity',reason='header_job_unverified')
+    monkeypatch.setattr(boss_chat,'open_conversation',open_chat)
+    return logged,checks
+
+
+async def test_withdrawn_deferred_chat_not_rechecked_on_timer(inbox,monkeypatch):
+    logged,checks=_withdrawn(inbox,monkeypatch)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    case=inbox.store.load(inbox.case['id'])
+    assert checks==[] and case['deferred_chat_preview']['12-0']
+    case['deferred_chat_check_at']=0;inbox.store.save(case)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    assert checks==[]
+
+
+async def test_withdrawn_deferred_chat_rechecked_once_on_new_message(inbox,monkeypatch):
+    logged,checks=_withdrawn(inbox,monkeypatch)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    inbox.rows[0]['text']='测试岗位 您好，还在招吗';inbox.rows[0]['unread']=True
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    case=inbox.store.load(inbox.case['id'])
+    assert checks==['12-0'] and case['withdrawn_unreadable']['12-0']['receiver']
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    assert checks==['12-0']
+
+
+async def test_withdrawn_unreadable_cleared_when_recheck_passes(inbox,monkeypatch):
+    logged,checks=_withdrawn(inbox,monkeypatch)
+    case=inbox.store.load(inbox.case['id']);case['withdrawn_unreadable']={'12-0':{'at':1,'receiver':'甲'}};case['deferred_chat_preview']={'12-0':'old'};inbox.store.save(case)
+    async def opened(session,**binding):
+        return {'valid':True,'chat_id':binding['chat_id'],'fingerprint':'v','coverage':'当前加载','messages':[]}
+    monkeypatch.setattr(boss_chat,'open_conversation',opened)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    case=inbox.store.load(inbox.case['id'])
+    assert case['deferred_chat_ids']==[] and not case.get('withdrawn_unreadable')
+
+
+async def test_active_job_deferred_chat_still_rechecked_on_timer(inbox,monkeypatch):
+    logged,checks=_withdrawn(inbox,monkeypatch,withdrawn=False)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    assert checks==['12-0']
+
+
+async def test_withdrawn_recheck_skipped_by_page_problem_is_retried(inbox,monkeypatch):
+    logged,checks=_withdrawn(inbox,monkeypatch)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    inbox.rows[0]['text']='测试岗位 您好';inbox.rows[0]['unread']=True
+    async def blocked(page,js):return {'editor_count':1,'has_draft':True,'login':False,'challenge':False,'chat_rows':1}
+    monkeypatch.setattr(boss_chat,'_bound_read',blocked)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    case=inbox.store.load(inbox.case['id'])
+    assert checks==[] and not case.get('withdrawn_unreadable')
+    async def clear(page,js):return {'editor_count':0,'has_draft':False,'login':False,'challenge':False,'chat_rows':1}
+    monkeypatch.setattr(boss_chat,'_bound_read',clear)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    assert checks==['12-0']
+
+
+async def test_withdrawn_recheck_ignores_unread_toggle_and_own_replies(inbox,monkeypatch):
+    # 评审：打开会话会清掉未读、管理员手动回复也会改摘要，都不能再生成一条待办。
+    logged,checks=_withdrawn(inbox,monkeypatch)
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    inbox.rows[0]['text']='测试岗位 您好，还在招吗';inbox.rows[0]['unread']=True
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    first=inbox.store.load(inbox.case['id'])['withdrawn_unreadable']['12-0']['at']
+    inbox.rows[0]['unread']=False
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    inbox.rows[0]['text']='测试岗位 [送达] 您好，岗位还在招'
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    case=inbox.store.load(inbox.case['id'])
+    assert checks==['12-0'] and case['withdrawn_unreadable']['12-0']['at']==first
+
+
+async def test_withdrawn_chat_unread_before_deploy_is_rechecked_on_first_sight(inbox,monkeypatch):
+    # 评审：上线前就在等回复的旧会话，第一次看到且有未读时直接复核一次。
+    logged,checks=_withdrawn(inbox,monkeypatch)
+    inbox.rows[0]['unread']=True
+    await ap.sync_and_follow(inbox.manager,inbox.job,NS(),inbox.store.load(inbox.case['id']))
+    assert checks==['12-0'] and inbox.store.load(inbox.case['id'])['withdrawn_unreadable']['12-0']

@@ -126,3 +126,62 @@ async def test_confirmed_answer_reopens_after_plan_and_resolves_only_on_receipt(
  assert p['outbox'][-1]['text']=='按月结算。' and p['outbox'][-1]['status']=='sent'
  assert 'pending_question_id' not in p
  assert next(x for x in AttentionStore(m.db).reconcile([],[c]) if x['id']==todo['id'])['status']=='resolved'
+
+
+async def _send_with(env,monkeypatch,send):
+ from cloakup import autopilot
+ from cloakup.autonomy import next_step
+ m,s,c,p,t=env;m.account_execution.set_task(t['id'],[c['id']],'running')
+ todo=next(x for x in AttentionStore(m.db).reconcile([],[c]) if x['kind']=='question')
+ async def generate(*a,**kw):return {'id':'plan','reply':'已纳入确认答案'}
+ m.generate_definition_plan=generate
+ await s.submit(t['id'],{'reviewed':True,'message':'结算周期','answer':'按月结算。'},todo);await finish(s)
+ c=m.cases.load(c['id']);p=c['candidates'][p['id']]
+ snap={'messages':[{'external_id':'q','direction':'in','text':'结算周期是多久？'}],'fingerprint':'same'}
+ autopilot.revisit_question(m.cases,c,p,snap)
+ events=[]
+ async def read(*a,**kw):return snap
+ async def checkpoint(*a):pass
+ async def sleep(*a):pass
+ m.checkpoint=checkpoint;m.event=lambda job,kind,text,**kw:events.append(text)
+ monkeypatch.setattr(autopilot.boss_chat,'read_conversation',read);monkeypatch.setattr(autopilot.boss_chat,'send_once',send);monkeypatch.setattr(autopilot.asyncio,'sleep',sleep)
+ await autopilot.dispatch_reply(m,{'account_runner':True},object(),c,p,snap,next_step(p))
+ c=m.cases.load(c['id']);return m,c,c['candidates'][p['id']],events
+
+
+async def test_aborted_send_marks_stale_and_does_not_mark_unknown(env,monkeypatch):
+ # 11-27 10:28 赵清山：点发送前收到新消息而中止，不记回执未知、不留草稿记录。
+ from cloakup import boss_chat
+ async def send(*a,**kw):raise boss_chat.SendAborted('x',reason='reply_during_typing',typed=True,cleared=True)
+ m,c,p,events=await _send_with(env,monkeypatch,send)
+ assert p['outbox'][-1]['status']=='stale' and p['status']!='delivery_unknown'
+ assert '本次未点击发送：输入期间收到新消息；已删除未发送的文字' in events
+ with pytest.raises(FileNotFoundError):m.db.get('system_draft','boss')
+
+
+async def test_aborted_send_not_cleared_records_system_draft(env,monkeypatch):
+ from cloakup import boss_chat
+ async def send(*a,**kw):raise boss_chat.SendAborted('x',reason='reply_during_typing',typed=True,cleared=False)
+ m,c,p,events=await _send_with(env,monkeypatch,send)
+ draft=m.db.get('system_draft','boss')
+ assert draft['chat_id']=='12-0' and draft['receiver']=='甲' and draft['text']=='按月结算。' and draft['job_label']==c['job']['label'] and draft['case_id']==c['id']
+ assert events[-1].endswith('未能删除，任务会在页面检查时暂停')
+
+
+async def test_other_send_errors_still_mark_unknown(env,monkeypatch):
+ from cloakup.sourcing import SourcingError
+ async def send(*a,**kw):raise SourcingError('发送后读取失败')
+ m,c,p,events=await _send_with(env,monkeypatch,send)
+ assert p['outbox'][-1]['status']=='delivery_unknown'
+ assert any('发送后读取失败' in e for e in events)
+
+
+async def test_existing_draft_abort_cools_candidate_down(env,monkeypatch):
+ # 评审：人工草稿留在框里时，每轮都会重新认领再中止；按候选人冷却一段时间，中止也不占当天额度。
+ import time
+ from cloakup import boss_chat
+ from cloakup.job_quota import attempted_on,day_key
+ async def send(*a,**kw):raise boss_chat.SendAborted('x',reason='existing_draft',typed=False,cleared=False)
+ m,c,p,events=await _send_with(env,monkeypatch,send)
+ assert p['decision_wait_until']>time.time()+600 and p['decision_wait_revision']==c.get('config_revision',0)
+ assert not attempted_on(p['outbox'][-1],day_key(time.time()))

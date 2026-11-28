@@ -110,7 +110,7 @@ def save_config(store,case,body):
  case['job']['snapshot']['requirements']=cfg['jd'];case['job']['revision']+=1
  case['confirmed_facts']=cfg['facts']
  case.update(search_plan=cfg['plan'],anonymous_job=cfg['anonymous_job'],desired_greeting=cfg['greeting'].strip(),
-             recommend_filters=cfg['filters'],execution=cfg['execution'],faq=cfg['faq'],job_sourcing={'greeting':cfg['greeting'].strip(),'outreach_terms':list(cfg['execution']['outreach_terms']),'recommend_filters':list(cfg['filters'])})
+             recommend_filters=cfg['filters'],execution=cfg['execution'],faq=cfg['faq'],job_sourcing={'greeting':cfg['greeting'].strip(),'outreach_terms':list(cfg['execution']['outreach_terms']),'recommend_filters':list(cfg['filters']),'must_haves':copy.deepcopy((case.get('job_sourcing') or {}).get('must_haves') or [])})
  policy=case.get('autonomy',{})
  policy.update(revision=policy.get('revision',0)+1,**{k:cfg['execution'][k] for k in ('poll_seconds','daily_new_limit','max_messages_per_candidate_day')})
  case['autonomy']=policy

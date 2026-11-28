@@ -80,7 +80,7 @@ def test_report_measures_outcomes_latency_and_idle_time(env):
     assert report['outcomes']['reply_latency']['median_minutes'] == 10
     assert report['outcomes']['unanswered_replies'] == 1
     ops = report['operations']
-    assert ops['batches'] == {'started': 2, 'submitted': 1, 'skipped_after_review': 1}
+    assert ops['batches'] == {'started': 2, 'submitted': 1, 'skipped_after_review': 1, 'screened_out_after_review': 0, 'screening_unavailable': 0}
     assert ops['outreach_held_minutes']['isolation'] == 290  # 10:40 → 15:30 下一次开聊批次
     gaps = {(g['from_clock'], g['to_clock']) for g in ops['idle_gaps']}
     assert ('14:00', '15:30') in gaps and ('15:30', '18:00') in gaps
@@ -96,6 +96,7 @@ def test_suggestions_and_markdown_cover_the_three_questions(env):
     markdown = dr.render_markdown(report)
     assert '## 异常与自动修复' in markdown and '## 操作分析' in markdown and '## 建议' in markdown
     assert '| 会话选择恢复 |' in markdown and '恢复后立刻通过' in markdown
+    assert '审阅后暂不联系 1 位，不符合必须项 0 位，初筛暂不可用 0 次' in markdown
 
 
 def test_generate_persists_json_and_markdown(env):
@@ -234,6 +235,10 @@ def test_new_outreach_and_isolation_event_texts_are_classified():
     assert _classify({'message':'主动开聊入口暂不可用（未找到唯一的实际页面控件：推荐），先继续处理收件，约 15 分钟后重试开聊'})==('outreach_entry','retry')
     assert _classify({'message':'岗位有未核实的隔离会话（隔离不足 2 小时），暂缓新增开聊'})==('isolation','outreach_held')
     # 11-26 “照写不拦”：话术写入失败不再暂停开聊，单列为自动重试。
+    # 11-27 10:28 赵清山：点发送前中止单独分类；删不掉的会暂停，需人工。
+    assert _classify({'message':'本次未点击发送：输入期间收到新消息；已删除未发送的文字'})==('send_aborted','auto_recovered')
+    assert _classify({'message':'本次未点击发送：输入期间收到新消息；输入框里的文字未能删除，任务会在页面检查时暂停'})==('send_aborted','manual')
+    assert _classify({'message':'本次消息回执未核实：SourcingError：发送后读取失败'})==('delivery_unknown','manual')
     assert _classify({'message':'首聊话术未能写入 BOSS：岗位设置页面尚未加载；未修改；首聊照常进行，候选人会收到 BOSS 上该岗位现有的招呼语，约 10 分钟后再试写入'})==('greeting_unwritten','retry')
 
 
@@ -306,3 +311,18 @@ def test_browser_errand_events_are_classified_and_reported(env):
     row = next(r for r in report['anomalies'] if r['category'] == 'browser_errand')
     assert row['outcomes'] == {'done': 1, 'failed': 1} and row['pauses'] == 0
     assert '浏览器代办' in dr.render_markdown(report)
+
+
+def test_precontact_screening_events_are_counted_apart_from_skips():
+    # 初筛不符合必须项另计，不算“审阅后暂不联系”；初筛暂不可用计次数；岗位让位与打开资料到上限归入异常分类。
+    events = [{'message': '候选人 2 不符合本岗位必须项（有团队管理经验），不开聊，继续查看下一张推荐卡片'},
+              {'message': '候选人 3 不符合本岗位必须项（有团队管理经验），不开聊，继续查看下一张推荐卡片'},
+              {'message': '候选人 4 暂不联系，继续查看下一张推荐卡片'},
+              {'message': '初筛暂不可用（模型初筛暂不可用或输出不合格），先放下这一位'}]
+    assert dr._batches(events) == {'started': 0, 'submitted': 0, 'skipped_after_review': 1, 'screened_out_after_review': 2, 'screening_unavailable': 1}
+    assert dr._classify({'message': '初筛暂不可用（模型初筛暂不可用或输出不合格），先放下这一位'}) == ('screening', 'retry')
+    assert dr._classify({'message': '该岗位本批审阅的人不符合必须项或初筛暂不可用，先让其他岗位开聊，约 30 分钟后再看'}) == ('outreach_screened', 'job_screened_out')
+    yielded = dr._batches([{'message': '该岗位本批审阅的人不符合必须项或初筛暂不可用，先让其他岗位开聊，约 30 分钟后再看'}])
+    assert yielded['screened_out_after_review'] == 0 and yielded['screening_unavailable'] == 0  # 岗位让位不是单人初筛失败
+    assert dr._classify({'message': '今天打开资料已到上限，本岗位今天不再审阅推荐'}) == ('profile_views', 'job_exhausted')
+    assert dr._classify(events[0]) is None

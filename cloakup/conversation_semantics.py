@@ -69,7 +69,7 @@ def current(case,person):
     return record if record and record.get('state_key')==fingerprint(case,person) else None
 
 
-def redact(text,person):
+def redact(text,person,limit=1600):
     """去掉身份与联系方式后返回，不整段拒绝。
 
     2026-11-24 起（管理员确认）：只隐去姓名、称呼、联系方式、证件／平台标识、年龄性别和附件文件名；
@@ -78,7 +78,7 @@ def redact(text,person):
     已知局限：候选人用英文名自称时，英文名可能保留。
     """
     if not isinstance(text,str):raise PrivacyReviewRequired('对话内容格式不正确，未发送模型')
-    text=text[:1600]
+    text=text[:limit]
     # 附件只告诉模型“有附件”，文件名常带姓名或拼音。
     text=re.sub(r'[^\s，,。！？!?/\\:：]+\.(?:pdf|docx?|jpe?g|png|xlsx?|pptx?|txt|zip|rar)\b','[附件]',text,flags=re.I)
     p=person.get('profile',{}); names=[]

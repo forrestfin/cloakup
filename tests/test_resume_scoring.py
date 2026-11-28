@@ -72,9 +72,13 @@ class FakeLLM:
         self.result = result
         self.error = error
         self.prompts = []
+        self.schemas = []
+        self.systems = []
 
     async def json(self, *, system, content, schema, effort='low', structured=True):
         self.prompts.append(content)
+        self.schemas.append(schema)
+        self.systems.append(system)
         if self.error:
             raise self.error
         return self.result
@@ -234,6 +238,76 @@ async def test_model_output_with_identifier_is_not_pushed(env):
     llm = FakeLLM(result={'score': 5, 'basis': '符合', 'comment': '可联系 13900139000'})
     with pytest.raises(rs.ScoringUnavailable, match='已拦截'):
         await rs.evaluate(m, case, p, record, make_docx(RESUME_LINES), llm=llm)
+
+
+# ---------------------------------------------------------------- 必须项（11-27 首聊前初筛同一套必须项）
+
+MUST_HAVES = [{'id': 'mh1', 'text': '有数据分析经验', 'source': 'admin', 'note': '客户原话：一定要做过数据', 'added_at': 1},
+              {'id': 'mh2', 'text': '能接受出差', 'source': 'client_feedback', 'note': '客户说经常出差', 'added_at': 2}]
+
+
+def with_must_haves(case, p, unclear_ids=(), revision=None):
+    from cloakup.job_sourcing import must_haves_revision
+    case['job_sourcing'] = {'must_haves': [dict(v) for v in MUST_HAVES]}
+    p['screening'] = {'revision': must_haves_revision(MUST_HAVES) if revision is None else revision,
+                      'items': [], 'outcome': 'pass', 'unclear_ids': list(unclear_ids)}
+
+
+async def test_unmet_must_have_caps_score_at_two(env):
+    m, task, case, p, record = env
+    m.db.put('disclosure_consent', rs.CONSENT_ID, CONSENT)
+    with_must_haves(case, p, unclear_ids=['mh2'])
+    llm = FakeLLM(result={'score': 5, 'basis': '经历贴合', 'comment': '经历贴合。',
+                          'must_haves': [{'id': 'mh1', 'verdict': 'met', 'evidence': '负责运营分析项目'},
+                                         {'id': 'mh2', 'verdict': 'unmet', 'evidence': '简历写明不接受出差'}]})
+    result = await rs.evaluate(m, case, p, record, make_docx(RESUME_LINES), llm=llm)
+    assert result['score'] == 2 and result['unmet'] == ['能接受出差'] and result['to_verify'] == []
+    payload = json.loads(llm.prompts[0])
+    assert payload['must_haves'] == [{'id': 'mh1', 'text': '有数据分析经验'}, {'id': 'mh2', 'text': '能接受出差'}]
+    assert payload['precontact_unclear'] == ['能接受出差'] and '客户' not in llm.prompts[0]
+    assert 'must_haves' in llm.schemas[0]['properties']
+    lines = rs.evaluation_lines(result)
+    assert '推荐评分：2/5' in lines and '不符合必须项：能接受出差' in lines and '待核实' not in lines
+
+
+async def test_unclear_listed_to_verify(env):
+    m, task, case, p, record = env
+    m.db.put('disclosure_consent', rs.CONSENT_ID, CONSENT)
+    # 首聊前初筛的版本与当前必须项不同：不带 precontact_unclear 条目。
+    with_must_haves(case, p, unclear_ids=['mh1'], revision='stale')
+    # 模型漏判 mh2、多给一个未知 id：漏判按 unclear，未知 id 丢弃。
+    llm = FakeLLM(result={'score': 4, 'basis': '多数符合', 'comment': '多数符合。',
+                          'must_haves': [{'id': 'mh1', 'verdict': 'unclear', 'evidence': '资料未提及'},
+                                         {'id': 'zz', 'verdict': 'unmet', 'evidence': '无关'}]})
+    result = await rs.evaluate(m, case, p, record, make_docx(RESUME_LINES), llm=llm)
+    assert json.loads(llm.prompts[0])['precontact_unclear'] == []
+    assert result['score'] == 4 and result['unmet'] == [] and result['to_verify'] == ['有数据分析经验', '能接受出差']
+    assert [i['id'] for i in result['must_haves']] == ['mh1', 'mh2']
+    lines = rs.evaluation_lines(result)
+    assert '待核实：有数据分析经验；能接受出差' in lines and '不符合必须项' not in lines
+
+
+async def test_must_have_evidence_with_identifier_is_blocked(env):
+    m, task, case, p, record = env
+    m.db.put('disclosure_consent', rs.CONSENT_ID, CONSENT)
+    with_must_haves(case, p)
+    llm = FakeLLM(result={'score': 4, 'basis': '符合', 'comment': '符合。',
+                          'must_haves': [{'id': 'mh1', 'verdict': 'met', 'evidence': '联系 13900139000'}]})
+    with pytest.raises(rs.ScoringUnavailable, match='已拦截'):
+        await rs.evaluate(m, case, p, record, make_docx(RESUME_LINES), llm=llm)
+
+
+async def test_no_must_haves_unchanged(env):
+    m, task, case, p, record = env
+    m.db.put('disclosure_consent', rs.CONSENT_ID, CONSENT)
+    llm = FakeLLM(result={'score': 5, 'basis': '符合', 'comment': '符合。',
+                          'must_haves': [{'id': 'x', 'verdict': 'unmet', 'evidence': '无'}]})
+    result = await rs.evaluate(m, case, p, record, make_docx(RESUME_LINES), llm=llm)
+    payload = json.loads(llm.prompts[0])
+    assert set(payload) == {'job_requirements', 'conversation', 'resume_text'}
+    assert 'must_haves' not in llm.schemas[0]['properties'] and llm.systems[0] == rs.SYSTEM
+    assert result['score'] == 5 and set(result) == {'status', 'score', 'basis', 'comment', 'model', 'at'}
+    assert '必须项' not in rs.evaluation_lines(result) and '待核实' not in rs.evaluation_lines(result)
 
 
 # ---------------------------------------------------------------- 通知集成

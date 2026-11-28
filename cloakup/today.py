@@ -9,7 +9,7 @@ import copy
 import time
 from datetime import datetime
 
-from . import daily_report, job_members, job_quota
+from . import daily_report, job_members, job_quota, screening
 from .attention import order as todo_order
 from .autonomy import day_key
 from .scenarios import is_sourcing
@@ -17,7 +17,7 @@ from .sourcing import TERMINAL
 from .task_policy import DEFAULT_SCHEDULE, window_status
 
 LABELS={'running':'运行中','outside_window':'等待执行时段','resting':'休息中','paused_admin':'暂停中','paused_system':'暂停中','blocked':'受阻'}
-NUMBERS=('quota_used','quota_share','first_contacts_sent','incoming','replies_sent','resumes','greetings','greetings_unanswered','waiting_now')
+NUMBERS=('quota_used','quota_share','first_contacts_sent','incoming','replies_sent','resumes','greetings','greetings_unanswered','waiting_now','profiles_reviewed','screened_out')
 ANSWERING=('sending','sent','delivery_unknown')  # 已发出或可能已发出的我方消息，算作“已回”
 AUDIT_TEXT={'resume_file_archived':'收到一份简历','candidate_opt_out':'候选人表示不考虑','consultant_handoff':'转顾问接续'}
 TODO_LIMIT,ACTIVITY_LIMIT,DETAIL_LIMIT=5,10,120
@@ -116,10 +116,11 @@ def build(db,store,cases,members,availability,now=None)->dict:
         for cid in job_ids:
             case=by_id.get(cid)
             if not case:continue
-            row=daily_report.outcomes([case],start,end)[0][0];greet,silent=_greetings(case,start,end)
+            row=daily_report.outcomes([case],start,end)[0][0];greet,silent=_greetings(case,start,end);screened=screening.stats(case,start)
             jobs.append({'case_id':cid,'label':case.get('job',{}).get('label',''),'quota_used':quota['usage'].get(cid,0),'quota_share':quota['shares'].get(cid,0),
                 'first_contacts_sent':row['first_contacts'],'incoming':row['replies'],'replies_sent':row['messages_sent'],'resumes':row['resumes_archived'],
-                'greetings':greet,'greetings_unanswered':silent,'waiting_now':_waiting(case)})
+                'greetings':greet,'greetings_unanswered':silent,'waiting_now':_waiting(case),
+                'profiles_reviewed':screened['reviewed'],'screened_out':screened['rejected'],'must_haves':len((case.get('job_sourcing') or {}).get('must_haves') or [])})
             for p in _people(case):
                 for m in p.get('outbox',[]):
                     if m.get('status')=='sent' and m.get('sent_at') and start<=m['sent_at']<end:

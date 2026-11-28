@@ -25,10 +25,23 @@ ISOLATED_TODO_SECONDS = 24 * 3600
 # 岗位变更排队超过这么久仍未到执行器安全点才提醒；同一岗位当天推荐页入口失败达到这么多次才提醒。
 JOB_CHANGE_STUCK_SECONDS = 30 * 60
 OUTREACH_BLOCKED_DEFERRALS = 3
+SCREENING_UNAVAILABLE_FAILURES = 3
 
 def order(t):
     """待办排序：未解决在前，登录／验证等优先，同类按创建时间新到旧（待办中心与首页共用）。"""
     return (t['status']=='resolved',{'login':0,'verification':0,'delivery':0,'capacity':1,'execution':1,'execution_recovery':1,'question':2,'handoff':3}.get(t['kind'],4),-t['created_at'])
+
+def _own_draft_note(db):
+    """11-27 10:43：输入框里是系统自己点发送前中止、又没删掉的文字时，说清是谁的会话、可以直接删。24 小时内有效。"""
+    try:draft=db.get('system_draft','boss')
+    except FileNotFoundError:return ''
+    if time.time()-(draft.get('at') or 0)>24*3600:return ''
+    text=(draft.get('text') or '')[:200]
+    # 只凭时间判断不了框里现在是谁的字：写出原文，让管理员比对；不是这段就按人工草稿处理。
+    return ('系统给'+(draft.get('receiver') or '一位候选人')+'（'+(draft.get('job_label') or '岗位')+'）准备过一段回复，点发送前中止、删除失败：「'+text+'」。'
+            '如果输入框里正是这段，那是系统自己没发出的文字，没有发给候选人，确认后删除即可继续，下一轮系统会按最新对话重新回复；'
+            '如果不是这段文字，就是人工草稿，请按下面的说明处理。')
+
 
 class AttentionStore:
     def __init__(self,db):self.db=db
@@ -73,6 +86,7 @@ class AttentionStore:
             member=next((m for m in members if m['id']==task_id),None)
             resumed=bool(member and member['status']=='running')
             detail=('任务已重新启用，旧异常仍待核验；进入允许的执行时段后先只读检查目标会话，成功后自动关闭待办。' if resumed else '自动恢复未能安全完成，已暂停关联任务。请打开任务执行浏览器，接管检查页面和会话列表，再恢复任务核验。' if blocked else '任务正在重新核验会话选择；核验成功后自动关闭此待办。')
+            if blocked and not resumed and diagnostics.get('reason')=='draft_present':detail=_own_draft_note(self.db)+detail
             def count(value,default):return max(0,min(value,100)) if type(value) is int else default
             add(key,'execution_recovery','会话选择恢复需要管理员处理',detail,
                 task_id=task_id,case_id=case_id,run_id=run['id'],job_label=case_labels.get(case_id,''),
@@ -189,6 +203,21 @@ class AttentionStore:
             if n<OUTREACH_BLOCKED_DEFERRALS:continue
             add('job_outreach_blocked:'+today+':'+cid,'job_outreach_blocked','岗位首聊入口反复失败','岗位「'+case_labels.get(cid,'')+'」今天推荐页切换或核对已失败 '+str(n)+' 次。已做：只停这个岗位的首聊（稍后自动重试），收件、回复与其他岗位照常。需要：打开执行浏览器查看推荐牛人页能否选到该岗位；当天累计次数次日清零，此待办次日自动解除。',
                 case_id=cid,job_label=case_labels.get(cid,''))
+        # 同一岗位当天首聊前初筛连续失败：执行器在成功时清零；各执行器记录合计（只加最近一次失败晚于全部成功的记录），之后有过成功或次日即自动解除。
+        screening={};num=lambda v:v if type(v) in (int,float) else 0
+        for r in runs:
+            daily=r.get('screening_failures');counts=daily.get(today) if isinstance(daily,dict) else None
+            for cid,entry in (counts.items() if isinstance(counts,dict) else ()):
+                if not isinstance(entry,dict) or type(entry.get('n',0)) is not int:continue
+                acc=screening.setdefault(cid,{'n':0,'last_failed_at':0,'last_ok_at':0,'entries':[]})
+                acc['entries'].append(entry)
+                if num(entry.get('last_failed_at'))>=acc['last_failed_at'] and isinstance(entry.get('reason'),str):acc['reason']=entry['reason'][:60]
+                acc['last_failed_at']=max(acc['last_failed_at'],num(entry.get('last_failed_at')));acc['last_ok_at']=max(acc['last_ok_at'],num(entry.get('last_ok_at')))
+        for cid,acc in screening.items():
+            acc['n']=sum(e.get('n',0) for e in acc['entries'] if num(e.get('last_failed_at'))>acc['last_ok_at'])
+            if acc['n']<SCREENING_UNAVAILABLE_FAILURES or acc['last_failed_at']<=acc['last_ok_at']:continue
+            add('screening_unavailable:'+today+':'+cid,'screening_unavailable','岗位初筛暂不可用','岗位「'+case_labels.get(cid,'')+'」今天首聊前初筛已连续失败 '+str(acc['n'])+' 次'+(f'（最近一次：{acc["reason"]}）' if acc.get('reason') else '')+'。已做：失败的候选人先放下、稍后再看，其他工作照常，没有向候选人发消息。需要：查看模型网关是否可用、执行浏览器里推荐牛人详情能否打开；恢复后此待办自动解除。',
+                case_id=cid,job_label=case_labels.get(cid,''))
         # 提示：已撤下首聊且没有进行中会话的岗位可以移除；移除后或恢复首聊、来了新会话时自动解除。
         from .job_changes import OPEN as CHANGE_OPEN,_open_conversations
         from .job_members import normalize as normalize_members
@@ -256,7 +285,7 @@ class AttentionStore:
         elif health and not health.get('healthy') and time.time()-health.get('at',0)<24*3600:
             if health.get('reason')=='draft_present':
                 add('browser_health:draft:'+str(int(health['at']//3600)),'browser_health','执行浏览器里有一段没发出去的文字',
-                    'BOSS 沟通页的输入框里有一段还没发送的文字。为了不丢掉它，系统不会刷新页面，也不会替你发送，这期间自动处理会受影响。'
+                    _own_draft_note(self.db)+'BOSS 沟通页的输入框里有一段还没发送的文字。为了不丢掉它，系统不会刷新页面，也不会替你发送，这期间自动处理会受影响。'
                     '请'+BROWSER_CONTROL+'，看一下这段文字：需要就手动发出去，不需要就删掉。处理完系统会自动继续，此待办自动解除。',screenshot=health.get('screenshot'))
             elif health.get('exhausted'):
                 running=any(m.get('status')=='running' for m in members)
@@ -264,6 +293,15 @@ class AttentionStore:
                     'BOSS '+('沟通页' if health.get('kind')=='chat' else '推荐牛人页')+'一直停在“加载中”或内容出不来。系统已'+(done_steps(health.get('steps')) or '自动处理')+'，仍然不行；'
                     +('任务仍在运行，执行器约 10 分钟后会自动再试。收件、回复或开聊会暂时受影响。' if running else '目前没有运行中的任务，系统不会自动重试；恢复任务后执行器会先检查页面。')+
                     '请'+BROWSER_CONTROL+'，看一下画面：可以从左侧菜单“消息”进入沟通页；如果 BOSS 提示网络异常或要求重新登录，按页面提示处理；页面恢复正常后此待办自动解除。',screenshot=health.get('screenshot'))
+        for case in cases:
+            # 11-27 旧 QE：撤下岗位的旧会话认不出，候选人来了新消息系统也不会回，交给人工。每次新消息一条，管理员回复后可记录处理完成。
+            for chat_id,info in (case.get('withdrawn_unreadable') or {}).items():
+                if chat_id not in case.get('deferred_chat_ids',[]):continue  # 已恢复正常处理或不在列表里了
+                label=case.get('job',{}).get('label','')
+                add('withdrawn_chat:'+case['id']+':'+chat_id+':'+str(int(info.get('at') or 0)),'withdrawn_chat','旧岗位会话需人工回复',
+                    (info.get('receiver') or '一位候选人')+'在已撤下的岗位「'+label+'」的会话里有新消息，但系统认不出这条旧会话（会话头部的沟通职位和岗位名对不上），不会自动回复。'
+                    '已做：不再定时复核，只在这条会话再有新消息时复核一次。需要：在 BOSS 手动回复这位候选人，处理后填写说明并“记录处理完成”；系统复核通过时此待办自动关闭。',
+                    case_id=case['id'],job_label=label)
         for case in cases:
             # 会话相关待办只发管理员能处理的，并用大白话写清楚“发生了什么、系统做了什么、你可以做什么”。
             def person_of(chat_id,case=case):
@@ -353,7 +391,7 @@ class AttentionStore:
         todo=self.db.get('attention',ident)
         status=body.get('status');note=body.get('note','')
         if status not in ('pending','in_progress','resolved') or not isinstance(note,str) or len(note)>4000:raise ValueError('待办状态或处理说明不合法')
-        if status=='resolved' and todo['kind'] in ('login','verification','capacity','delivery','execution','execution_recovery','greeting','platform_action','decision','operator','planning','action','browser_health','job_change_stuck','job_not_validated','task_not_validated','job_outreach_blocked','browser_errand_stuck'):
+        if status=='resolved' and todo['kind'] in ('login','verification','capacity','delivery','execution','execution_recovery','greeting','platform_action','decision','operator','planning','action','browser_health','job_change_stuck','job_not_validated','task_not_validated','job_outreach_blocked','screening_unavailable','browser_errand_stuck'):
             raise ValueError('请先在关联任务或平台核实并处理；该类待办由真实状态自动解除')
         if status=='resolved' and not note.strip():raise ValueError('请填写处理结果，便于追溯')
         todo.update(status=status,updated_at=time.time(),note=note)

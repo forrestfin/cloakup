@@ -332,3 +332,20 @@ def test_system_pause_reason_from_login_todo_keyed_by_run(env):
     env.task([case['id']], status='paused', history=[{'at': at('14:12'), 'status': 'paused', 'actor': 'system', 'reason': 'x'}])
     env.db.put('attention', 'l', {'id': 'l', 'kind': 'login', 'title': '需要重新登录', 'detail': '', 'status': 'pending', 'run_id': 'r1', 'created_at': at('14:12')})
     assert env.build()['tasks'][0]['detail'] == '需要重新登录'
+
+
+def test_today_reports_screening_numbers(env):  # 11-27 Task 9：今天页按岗位显示当天审阅与初筛不符
+    case = env.case('交付顾问')
+    case['job_sourcing'] = {'greeting': '', 'outreach_terms': [], 'recommend_filters': [], 'must_haves': [{'id': 'mh_a', 'text': '条件一', 'source': 'jd', 'note': '', 'added_at': at('08:00')}]}
+    reject = {'revision': 'r', 'at': at('10:00'), 'outcome': 'reject', 'unclear_ids': [], 'items': [{'id': 'mh_a', 'verdict': 'unmet', 'evidence': '资料未提及'}]}
+    env.person(case, 'p1')['profile_reviewed_at'] = at('10:00')
+    p2 = env.person(case, 'p2');p2['profile_reviewed_at'] = at('10:05');p2['screening'] = reject
+    p3 = env.person(case, 'p3');p3['profile_reviewed_at'] = at('10:00', YESTERDAY);p3['screening'] = {**reject, 'at': at('10:00', YESTERDAY)}
+    env.store.save(case)
+    other = env.case('其他岗位')
+    env.task([case['id'], other['id']])
+    task = env.build()['tasks'][0]
+    job = _job(env.build(), case['id'])
+    assert (job['profiles_reviewed'], job['screened_out'], job['must_haves']) == (2, 1, 1)
+    assert _job(env.build(), other['id'])['must_haves'] == 0
+    assert task['totals']['profiles_reviewed'] == 2 and task['totals']['screened_out'] == 1

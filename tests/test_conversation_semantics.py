@@ -61,6 +61,13 @@ def test_redaction_keeps_employer_school_city_and_never_refuses(example):
     assert len(cs.redact('长'*3000,p))==1600
 
 
+def test_redact_respects_limit(example):
+    # 11-27 联系前筛选：在线简历正文较长，需按 6000 字上限脱敏；默认 1600 不变。
+    _,p=example;t='长'*3000
+    assert len(cs.redact(t,p))<=1600
+    assert cs.redact(t,p,limit=6000)==t
+
+
 @pytest.mark.parametrize('text',['汤女士简历.pdf\n点击预览附件简历','MAR-wuhan.doc\n点击预览附件简历','Zhang_San_CV.docx'])
 def test_attachment_file_names_never_reach_the_model(example,text):
     # 11-24 候选人 20 的附件名 MAR-wuhan.doc 被当作未知英文实体整段拒绝。

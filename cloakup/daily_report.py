@@ -35,6 +35,9 @@ CATEGORIES = {
     'selection': ('会话选择恢复', 'auto', '单条会话失败自动重试，用完次数只放下这一条；只有页面级问题才暂停任务'),
     'isolation': ('隔离会话暂缓新开聊', 'partial', '到期只读复核通过后自动解除；长期复核不过需管理员核对原会话或允许开聊例外'),
     'outreach': ('岗位推荐页暂无可联系的人', 'auto', '当天不再为该岗位首聊，剩余额度按权重让给其他岗位；次日自动恢复'),
+    'outreach_screened': ('岗位本批审阅的人不符合必须项或初筛暂不可用', 'auto', '先让其他岗位开聊，约 30 分钟后再看该岗位；不让出当天额度'),
+    'profile_views': ('打开资料到当天上限', 'auto', '该岗位当天不再打开推荐资料，剩余首聊额度让给其他岗位，次日自动恢复；账号每天合计 80 份，按岗位权重分'),
+    'screening': ('首聊前初筛暂不可用', 'auto', '只放下这一位约 30 分钟，其他候选人照常；持续失败检查模型网关'),
     'outreach_entry': ('开聊入口暂不可用', 'auto', '推荐页没加载出来时先重开一次；仍不行只暂缓开聊约 15 分钟，收件照常'),
     'page_read': ('沟通页读取超时', 'auto', '按收件间隔重读；连续 3 次才停止本轮'),
     'profile_changed': ('推荐资料两次打开不一致', 'auto', '放下该候选人、作废未发送草稿，下一批继续'),
@@ -47,6 +50,7 @@ CATEGORIES = {
     'login': ('登录失效', 'manual', '在执行浏览器重新登录'),
     'verification': ('平台要求验证', 'manual', '在执行浏览器完成验证'),
     'draft': ('发现未发送草稿', 'manual', '检查并处理草稿后继续'),
+    'send_aborted': ('点发送前中止', 'auto', '消息一定没发出，记为未发送、删掉自己打的字，下一轮按最新对话重新决定；删不掉时页面检查会暂停任务'),
     'delivery_unknown': ('送达结果未确认', 'manual', '设计上不自动重发；等待回执同步或人工核对'),
     'decision_held': ('模型决策暂缓', 'auto', '退避后重试；持续失败检查模型网关'),
     'notification': ('飞书通知未送达', 'partial', '可重试错误自动重试；结果未知不重发，需人工核对'),
@@ -72,6 +76,9 @@ EVENT_RULES = [
     ('isolation', 'outreach_held', ('msg', '岗位有未核实的隔离会话')),
     ('outreach_entry', 'retry', ('msg', '主动开聊入口暂不可用')),
     ('outreach', 'job_exhausted', ('msg', '额度让给其他岗位')),
+    ('outreach_screened', 'job_screened_out', ('msg', '先让其他岗位开聊')),
+    ('profile_views', 'job_exhausted', ('msg', '今天打开资料已到上限')),
+    ('screening', 'retry', ('msg', '初筛暂不可用')),
     ('page_read', 'stopped', ('msg', '连续 3 次读取超时')),
     ('page_read', 'retry', ('msg', '沟通页面读取暂未完成')),
     ('profile_changed', 'skipped', ('msg', '资料在核对时发生变化')),
@@ -86,6 +93,9 @@ EVENT_RULES = [
     ('login', 'auto_recovered', ('kind', 'access_restored')),
     ('verification', 'manual', ('msg', '平台要求验证')),
     ('draft', 'manual', ('msg', '发现未发送的草稿')),
+    ('send_aborted', 'manual', ('msg', '任务会在页面检查时暂停')),
+    ('send_aborted', 'auto_recovered', ('msg', '本次未点击发送')),
+    ('delivery_unknown', 'manual', ('msg', '本次消息回执未核实')),
     ('job_change', 'applied', ('msg', '岗位变更已在安全点生效')),
     ('browser_errand', 'done', ('msg', '浏览器代办已完成')),
     ('browser_errand', 'failed', ('msg', '浏览器代办未完成')),
@@ -451,7 +461,7 @@ def _anomaly_table(events, audit_counts, notifications, pauses, end):
 
 
 def _batches(events):
-    started = submitted = skipped = 0
+    started = submitted = skipped = screened_out = unavailable = 0
     for event in events:
         message = str(event.get('message', ''))
         if message.startswith('开始主动开聊批次'):
@@ -461,7 +471,12 @@ def _batches(events):
             submitted += int(found.group(1))
         if '暂不联系' in message:
             skipped += 1
-    return {'started': started, 'submitted': submitted, 'skipped_after_review': skipped}
+        if '不符合本岗位必须项' in message:
+            screened_out += 1
+        if message.startswith('初筛暂不可用（'):  # 只数单人初筛失败；岗位让位消息里也有这几个字
+            unavailable += 1
+    return {'started': started, 'submitted': submitted, 'skipped_after_review': skipped,
+            'screened_out_after_review': screened_out, 'screening_unavailable': unavailable}
 
 
 def _suggestions(report):
@@ -562,7 +577,8 @@ def render_markdown(report):
     if report['anomalies']:
         lines += ['| 异常 | 次数 | 结果 | 能否自动修复 | 造成暂停 | 处理方式 |', '| --- | --- | --- | --- | --- | --- |']
         names = {'auto_recovered': '自动恢复', 'isolated': '只放下单条', 'paused': '暂停任务', 'retry': '重试中', 'stopped': '停止',
-                 'outreach_held': '暂缓开聊', 'skipped': '放下该候选人', 'waiting': '等待', 'manual': '待人工', 'kept_unknown': '保留未知', 'failed': '失败', 'job_not_validated': '岗位停发'}
+                 'outreach_held': '暂缓开聊', 'skipped': '放下该候选人', 'waiting': '等待', 'manual': '待人工', 'kept_unknown': '保留未知', 'failed': '失败', 'job_not_validated': '岗位停发',
+                 'job_exhausted': '当天让出', 'job_screened_out': '暂时让位'}
         for row in report['anomalies']:
             outcomes = '、'.join(f"{names.get(k, k)} {v}" for k, v in row['outcomes'].items())
             pause = f"{row['pauses']} 次 / {row['paused_minutes']} 分钟" if row['pauses'] else '无'
@@ -579,7 +595,7 @@ def render_markdown(report):
         lines.append('')
     ops = report['operations']
     lines += ['## 操作分析', '',
-              f"- 开聊批次 {ops['batches']['started']} 次，提交 {ops['batches']['submitted']} 次，审阅后暂不联系 {ops['batches']['skipped_after_review']} 位"]
+              f"- 开聊批次 {ops['batches']['started']} 次，提交 {ops['batches']['submitted']} 次，审阅后暂不联系 {ops['batches']['skipped_after_review']} 位，不符合必须项 {ops['batches']['screened_out_after_review']} 位，初筛暂不可用 {ops['batches']['screening_unavailable']} 次"]
     held = {k: v for k, v in ops['outreach_held_minutes'].items() if v}
     if held:
         labels = {'isolation': '隔离会话', 'greeting': '话术核验', 'release_changed': '版本不一致'}

@@ -368,3 +368,87 @@ def test_redraft_and_validate_restores_lapsed_validation_without_publishing(setu
     assert aw.validation_state(s.m.db,tid)[1:]==(set(),False)
     draft=s.lab.draft(tid,{});passing_test(s.lab,draft)
     assert aw.validation_state(s.m.db,tid)[1:]==({s.a['id']},True) and s.m.db.get('agent_release',tid)==release
+
+
+MH=[{'text':'有分布式系统研发经历','source':'client_feedback','note':'客户 11-27：要做过分布式'}]
+
+
+def _sourcing(s,cid):
+    return next(i for i in s.m.db.get('agent_bundle',s.m.db.get('agent_release',s.task['id'])['version_id'])['bundle']['sources'] if i['case_id']==cid)['sourcing']
+
+
+async def test_must_haves_change_tests_only_that_job_then_applies_at_safe_point(setup):
+    # 11-27 必须项：只验收该岗位，执行器安全点换绑，运行中的任务不暂停
+    s=setup;await _add_b(s);s.busy['job']={'id':'run'};before=s.m.db.get('agent_release',s.task['id'])
+    rec=jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':MH})
+    test=s.m.db.get('agent_test',rec['test_id'])
+    assert rec['status']=='testing' and rec['action']=='must_haves' and test['case_ids']==[s.a['id']]
+    assert next(i for i in test['bundle']['sources'] if i['case_id']==s.a['id'])['sourcing']['must_haves'][0]['text']==MH[0]['text']
+    assert jc.describe(s.m,rec)=='更新必须项「交付顾问」'
+    assert _sourcing(s,s.a['id'])['must_haves']==[] and s.m.cases.load(s.a['id'])['job_sourcing']['must_haves']==[]
+    assert (await _validated(s,rec))['status']=='pending'
+    applied=jc.apply_pending(s.m)
+    assert [r['id'] for r in applied]==[rec['id']] and s.m.db.get(jc.KIND,rec['id'])['status']=='applied'
+    release=s.m.db.get('agent_release',s.task['id'])
+    assert release['revision']==before['revision']+1 and applied[0]['version_id']==release['version_id']
+    must=s.m.cases.load(s.a['id'])['job_sourcing']['must_haves']
+    assert must[0]['text']==MH[0]['text'] and must[0]['note']==MH[0]['note'] and must==_sourcing(s,s.a['id'])['must_haves']
+    # 其他岗位与其余寻访配置原样
+    assert _sourcing(s,s.b['id'])['must_haves']==[] and {k:v for k,v in _sourcing(s,s.a['id']).items() if k!='must_haves'}=={k:v for k,v in s.m.db.get('agent_bundle',before['version_id'])['bundle']['sources'][0]['sourcing'].items() if k!='must_haves'}
+    member=_member(s)
+    assert member['release_id']==applied[0]['version_id'] and member['status']=='running' and member['history'][-1]['reason']=='job_change:must_haves'
+    assert validated_cases(s.m.db,s.task['id'])=={s.a['id'],s.b['id']}
+    assert_release_ready(s.m,s.task['id'])
+    assert s.m.cases.load(s.a['id'])['agent_release_id']==release['version_id']
+    assert jc.apply_pending(s.m)==[]
+
+
+async def test_must_haves_change_keeps_candidate_decisions(setup):
+    # 必须项改了不清候选人决策；旧初筛结论按必须项修订号自然过期
+    s=setup;s.busy['job']={'id':'run'}
+    case=s.m.cases.load(s.a['id']);p=s.m.cases.add_candidate(case,'p','https://www.zhipin.com/web/chat/index',{'summary':'职业资料'})
+    p.update(decision_wait_until=123.0,harness_decision={'action':'reply'});s.m.cases.save(case)
+    revision=s.m.cases.load(s.a['id'])['autonomy']['revision']
+    rec=jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':MH})
+    await _validated(s,rec);assert len(jc.apply_pending(s.m))==1
+    person=s.m.cases.load(s.a['id'])['candidates'][p['id']]
+    assert person['decision_wait_until']==123.0 and person['harness_decision']=={'action':'reply'}
+    assert s.m.cases.load(s.a['id'])['autonomy']['revision']==revision
+
+
+async def test_must_haves_failed_validation_keeps_old_list(setup):
+    s=setup;s.busy['job']={'id':'run'};s.outcome['passed']=False;before=s.m.db.get('agent_release',s.task['id'])
+    rec=jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':MH})
+    assert (await _validated(s,rec))['status']=='failed'
+    assert jc.apply_pending(s.m)==[] and s.m.db.get('agent_release',s.task['id'])==before
+    assert s.m.cases.load(s.a['id'])['job_sourcing']['must_haves']==[] and _sourcing(s,s.a['id'])['must_haves']==[]
+    todos=[t for t in AttentionStore(s.m.db).reconcile([],s.m.cases.list()) if t['kind']=='job_change']
+    assert len(todos)==1 and '更新必须项' in todos[0]['detail']
+
+
+async def test_must_haves_change_rebases_on_faq_but_fails_when_job_snapshot_changed(setup):
+    # 排队期间 FAQ 在安全点生效不影响必须项验收；岗位快照其他内容变了，验收不再对应，变更失败
+    s=setup;s.busy['job']={'id':'run'}
+    rec=jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':MH})
+    await _validated(s,rec)
+    fa.apply(s.m,{'id':'f'*32,'task_id':s.task['id'],'case_id':s.a['id'],'todo_id':'none','candidate_id':'none','question':'结算周期','answer':'按月结算。','status':'pending','at':time.time()})
+    assert len(jc.apply_pending(s.m))==1 and _sourcing(s,s.a['id'])['must_haves'][0]['text']==MH[0]['text']
+    assert validated_cases(s.m.db,s.task['id'])=={s.a['id']}
+    rec=jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':[]})
+    await _validated(s,rec)
+    release=s.m.db.get('agent_release',s.task['id']);version=s.m.db.get('agent_bundle',release['version_id'])
+    version['bundle']['sources'][0]['sourcing']['greeting']='您好，有个机会想和您聊聊。';s.m.db.put('agent_bundle',version['id'],version)
+    assert jc.apply_pending(s.m)==[] and s.m.db.get(jc.KIND,rec['id'])['status']=='failed' and '必须项的验收不再有效' in s.m.db.get(jc.KIND,rec['id'])['error']
+    assert s.m.cases.load(s.a['id'])['job_sourcing']['must_haves'][0]['text']==MH[0]['text']
+
+
+async def test_must_haves_change_rejects_bad_input(setup):
+    s=setup;s.busy['job']={'id':'run'}
+    for body,match in [({'action':'must_haves','case_id':s.b['id'],'must_haves':MH},'不在任务'),
+                       ({'action':'must_haves','case_id':s.a['id'],'must_haves':[{'text':'x'*61,'source':'jd'}]},'1至60'),
+                       ({'action':'must_haves','case_id':s.a['id'],'must_haves':'甲'},'列表'),
+                       ({'action':'must_haves','case_id':s.a['id']},'列表')]:
+        with pytest.raises(ValueError,match=match):jc.request(s.m,s.task['id'],body)
+    assert not s.m.db.list(jc.KIND)
+    jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':MH})
+    with pytest.raises(ValueError,match='等待生效'):jc.request(s.m,s.task['id'],{'action':'must_haves','case_id':s.a['id'],'must_haves':[]})

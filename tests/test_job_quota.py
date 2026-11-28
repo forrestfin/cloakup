@@ -142,3 +142,38 @@ def test_task_quota_view_reports_target_shares_and_usage():
     task['config']['removed_today'] = [{'case_id': 'other', 'day': day}];del task['config']['execution']['daily_new_limit']
     view = jq.task_quota(store, task, day)
     assert view['used'] == 10 and view['usage']['other'] == 4 and view['limit'] == 0 and view['target'] == 0 and view['shares'] == {'a': 0, 'b': 0}
+
+
+def test_views_allowed_by_weight():
+    # 每账号每天打开资料上限 80，按岗位权重分份额：3:1 → 60/20；权重 1 的岗位打开第 20 位后不再打开。
+    day = day_key()
+    task = _task([{'case_id': 'a', 'weight': 3, 'outreach': 'active'}, {'case_id': 'b', 'weight': 1, 'outreach': 'active'}])
+    assert jq.PROFILE_VIEW_CAP == 80 and jq.allocate(jq.PROFILE_VIEW_CAP, {'a': 3, 'b': 1}) == {'a': 60, 'b': 20}
+    def viewed(cid, n, at=None):
+        return {'id': cid, 'candidates': {f'p{i}': {'outbox': [], 'profile_reviewed_at': at or time.time()} for i in range(n)}}
+    yesterday = time.time() - 86400 * 2
+    store = _store([viewed('a', 19), {'id': 'b', 'candidates': {**viewed('b', 19)['candidates'], 'old': {'outbox': [], 'profile_reviewed_at': yesterday}, 'none': {'outbox': []}}}])
+    assert jq.views_by_case(store, ['a', 'b', 'c'], day) == {'a': 19, 'b': 19, 'c': 0}
+    assert jq.views_allowed(store, task, 'b', day) and jq.views_allowed(store, task, 'a', day)
+    store = _store([viewed('a', 59), viewed('b', 20)])
+    assert not jq.views_allowed(store, task, 'b', day) and jq.views_allowed(store, task, 'a', day)
+    assert not jq.views_allowed(_store([viewed('a', 60)]), task, 'a', day)
+    # 任务配置只能更严：profile_view_cap 40 → 30/10；配置得比 80 宽仍按 80。
+    task['config']['execution']['profile_view_cap'] = 40
+    assert not jq.views_allowed(_store([viewed('b', 10)]), task, 'b', day) and jq.views_allowed(_store([viewed('b', 9)]), task, 'b', day)
+    task['config']['execution']['profile_view_cap'] = 500
+    assert not jq.views_allowed(_store([viewed('b', 20)]), task, 'b', day)
+    assert not jq.views_allowed(store, task, 'missing', day)
+
+
+def test_view_cap_is_per_account_across_tasks():
+    # 账号每天打开资料合计 80：两个任务各自份额未满，但合计已到 80 时都不再打开。
+    day = day_key()
+    t1 = _task([{'case_id': 'a', 'weight': 1, 'outreach': 'active'}], tid='t1')
+    t2 = _task([{'case_id': 'b', 'weight': 1, 'outreach': 'active'}], tid='t2')
+    def viewed(cid, n):
+        return {'id': cid, 'candidates': {f'p{i}': {'outbox': [], 'profile_reviewed_at': time.time()} for i in range(n)}}
+    assert jq.views_allowed(_store([viewed('a', 40), viewed('b', 39)]), t1, 'a', day)
+    store = _store([viewed('a', 40), viewed('b', 40)])
+    assert not jq.views_allowed(store, t1, 'a', day) and not jq.views_allowed(store, t2, 'b', day)
+    assert jq.views_remaining(_store([viewed('a', 70), viewed('b', 5)]), t1, 'a', day) == 5

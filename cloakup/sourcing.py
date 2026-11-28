@@ -283,11 +283,28 @@ class CaseStore:
         ledger=ActionLedger(self.db)
         operation=ledger.claim(task_id='case:'+case['id'],resource='candidate:'+candidate_id+(':resume-receipt' if receipt_continuation else ''),capability='send_message',identity={'intent':message['intent'],'reply_id':message.get('decision',{}).get('reply_id'),'text_hash':hashlib.sha256(message['text'].encode()).hexdigest(),**({'resume_receipt_key':message['decision']['resume_receipt_key']} if message.get('decision',{}).get('resume_receipt_key') else {})},run_id=run_id or message_id,expectation={'case_id':case['id'],'candidate_id':candidate_id,'message_id':message_id,'job_revision':case['job']['revision']})
         ledger.transition(operation,'executing')
-        message.update(operation_id=operation,operation_state='executing',status="sending", claimed_at=time.time())
+        message.update(operation_id=operation,operation_state='executing',status="sending", claimed_at=time.time(), pre_claim_status=candidate["status"])
         candidate["status"] = "sending"
         self.audit(case, 'send_claimed', candidate_id=candidate_id, message_id=message_id,
                    text_sha256=hashlib.sha256(message['text'].encode()).hexdigest())
         return copy.deepcopy(self._payload(message))
+
+    def abort_send(self, case, candidate_id, message_id, reason):
+        """点击“发送”之前中止：消息一定没发出。账本记 failed（释放占位、允许重新认领），消息作废，候选人回到认领前状态。"""
+        candidate = self.candidate(case, candidate_id)
+        message = self._message(candidate, message_id)
+        from .action_gateway import ActionLedger
+        if message.get('operation_id') and message.get('operation_state') in ('claimed','executing'):
+            ActionLedger(self.db).transition(message['operation_id'],'failed',reason='点击发送前中止：'+reason)
+            message['operation_state']='failed'
+        if message["status"] != "sending":
+            # 授权检查发现消息已被作废等：只释放账本占位，不改消息与候选人。
+            self.audit(case, 'send_aborted', candidate_id=candidate_id, message_id=message_id, reason=reason)
+            return
+        message.update(status="stale", abort_reason=reason, approved_fingerprint=None)
+        candidate["status"] = message.get('pre_claim_status') or candidate["status"]
+        self._invalidate(candidate)
+        self.audit(case, 'send_aborted', candidate_id=candidate_id, message_id=message_id, reason=reason)
 
     def confirm_delivery(self, case, candidate_id, message_id, receipt, *, submission_only=False):
         candidate = self.candidate(case, candidate_id)

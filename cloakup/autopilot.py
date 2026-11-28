@@ -248,6 +248,12 @@ def daily_attempts(store, intent=None, day=None):
     return sum(attempted_on(m,day,intent) for case in store.list() for c in case['candidates'].values() for m in c['outbox'])
 
 
+# 点发送前中止的原因（boss_chat.SendAborted.reason）→ 管理员看得懂的说法
+ABORT_TEXT={'reply_during_typing':'输入期间收到新消息','text_mismatch':'输入后的正文不一致','send_button_not_unique':'发送按钮不唯一',
+            'not_authorized':'发送前授权已停止','changed_before_typing':'读取后会话有变化','existing_draft':'输入框已有人工草稿','editor_unavailable':'找不到唯一输入框',
+            'reread_failed':'输入后读取页面失败'}
+
+
 async def dispatch_reply(manager,job,session,case,candidate,snapshot,step):
     if not case.get('execution',{}).get('follow_up',True):return
     if step['action']=='wait' or (not candidate.get('inbox') and not step.get('nudge') and not step.get('resume_receipt_ack')):
@@ -388,8 +394,27 @@ async def dispatch_reply(manager,job,session,case,candidate,snapshot,step):
         store._message(fresh,message['id'])['status']='delivery_unknown';fresh['status']='delivery_unknown'
         store.audit(latest,'delivery_unknown',candidate_id=cid,message_id=message['id'],note='执行被中断，不自动重发')
         raise
+    except boss_chat.SendAborted as exc:
+        # 11-27 10:28 赵清山：点发送前中止，消息一定没发出。记“未发送”而不是回执未知；
+        # 删不掉自己打的字时记下来，页面检查暂停时待办能说清这是系统自己的文字。
+        latest=store.load(case['id'])
+        store.abort_send(latest,cid,message['id'],exc.reason)
+        if exc.reason in ('existing_draft','editor_unavailable'):
+            # 人工草稿或输入框异常不会自己消失：这位候选人冷却一段时间再决策，免得每轮认领又中止。
+            person=store.candidate(latest,cid)
+            person['decision_wait_until']=time.time()+jitter(1800);person['decision_wait_revision']=latest.get('config_revision',0)
+        store.save(latest)
+        note=ABORT_TEXT.get(exc.reason,exc.reason)
+        if exc.typed and not exc.cleared:
+            conv=fresh.get('conversation') or {}
+            manager.db.put('system_draft','boss',{'id':'boss','chat_id':conv.get('chat_id'),'receiver':conv.get('receiver'),'job_label':case['job']['label'],
+                'case_id':case['id'],'candidate_id':cid,'text':text,'text_sha256':hashlib.sha256(text.encode()).hexdigest(),'at':time.time()})
+        from .logbook import log
+        log('action',type='send_aborted',case_id=case['id'],candidate_id=cid,message_id=message['id'],reason=exc.reason,typed=exc.typed,cleared=exc.cleared)
+        manager.event(job,'step','本次未点击发送：'+note+('；已删除未发送的文字' if exc.cleared else '；输入框里的文字未能删除，任务会在页面检查时暂停' if exc.typed else ''))
+        return
     except Exception as exc:
-        receipt=None;manager.event(job,'step','本次消息回执未核实：'+type(exc).__name__)
+        receipt=None;manager.event(job,'step','本次消息回执未核实：'+type(exc).__name__+('：'+str(exc)[:120] if str(exc) else ''))
     latest=store.load(case['id']);fresh=store.candidate(latest,cid)
     if receipt:
         store.confirm_delivery(latest,cid,message['id'],receipt)
@@ -439,7 +464,7 @@ async def recheck_deferred_chat(manager,job,session,case,row):
     blocked=next((key for key in ('has_draft','login','challenge') if guard.get(key)),None)
     if blocked:
         log('state',type='deferred_chat_check',case_id=case['id'],chat_id=chat_id,result='skipped',reason=blocked)
-        return False
+        return None  # 页面级问题，没有复核
     try:
         bound=bind_chat(fresh,row)
         if bound:
@@ -456,7 +481,7 @@ async def recheck_deferred_chat(manager,job,session,case,row):
         failures[chat_id]=failures.get(chat_id,0)+1
         diagnostics=exc.diagnostics or {}
         log('state',type='deferred_chat_check',case_id=case['id'],chat_id=chat_id,result='failed',
-            reason=diagnostics.get('reason'),list_end=diagnostics.get('list_end'),failures=failures[chat_id])
+            reason=diagnostics.get('reason'),list_end=diagnostics.get('list_end'),failures=failures[chat_id],header_jobs=diagnostics.get('header_jobs'))
         if diagnostics.get('list_end'):
             # 已翻到列表最底部仍找不到：连续 MISSING_AFTER 次就认定会话已不在 BOSS 沟通列表里，
             # 不再反复滚动查找；它若重新出现在列表里，收件同步会自动恢复。
@@ -487,6 +512,57 @@ async def recheck_deferred_chat(manager,job,session,case,row):
     return True
 
 
+def _row_hash(row):
+    """会话列表行的摘要哈希：去掉时间字样，只在内容或未读变化时改变。"""
+    preview=re.sub(r'\b\d{1,2}:\d{2}\b|刚刚|\d+分钟前','',row.get('text',''))
+    return hashlib.sha256(json.dumps([preview,row.get('unread',False)],ensure_ascii=False).encode()).hexdigest()
+
+
+def withdrawn_case(manager,case_id):
+    """该岗位在未停止的任务里已撤下首聊（outreach=withdrawn）。"""
+    from .job_members import normalize
+    execution=getattr(manager,'account_execution',None)
+    if not execution:return False
+    for member in execution.members():
+        if member.get('status') in ('stopped','completed') or case_id not in member.get('case_ids',[]):continue
+        try:cfg=copy.deepcopy(manager.db.get('task',member['id'])['config']);entry=next((m for m in normalize(cfg) if m['case_id']==case_id),None)
+        except (FileNotFoundError,KeyError,ValueError):continue
+        if entry and entry['outreach']=='withdrawn':return True
+    return False
+
+
+# 列表摘要里我方消息带送达状态标记（候选人消息没有），据此判断最后一条是不是我方发的。
+OWN_PREVIEW=re.compile(r'\[(送达|已读|未读)\]')
+
+
+async def _recheck_withdrawn_chat(manager,job,session,case,row):
+    """撤下岗位的放下会话：摘要文字变了、且最后一条是候选人发的，才复核一次（第一次看到时有未读也复核）。
+    摘要只看文字不看未读：打开会话会清掉未读，管理员手动回复只改成我方消息，都不算候选人新消息。
+    复核仍认不出就记入 withdrawn_unreadable，由待办交给人工；复核通过则照常恢复。"""
+    store=manager.cases;chat_id=row['chat_id']
+    preview=re.sub(r'\b\d{1,2}:\d{2}\b|刚刚|\d+分钟前','',row.get('text',''))
+    row_hash=hashlib.sha256(preview.encode()).hexdigest()
+    fresh=store.load(case['id']);previews=fresh.setdefault('deferred_chat_preview',{})
+    if previews.get(chat_id)==row_hash:return
+    first=chat_id not in previews;old=previews.get(chat_id)
+    previews[chat_id]=row_hash;store.save(fresh)
+    if OWN_PREVIEW.search(preview) or (first and not row.get('unread')):return
+    ok=await recheck_deferred_chat(manager,job,session,store.load(case['id']),row)
+    fresh=store.load(case['id'])
+    if ok is None:
+        # 页面有草稿、掉登录或验证，没真正复核：摘要退回原值，下次再试。
+        fresh.setdefault('deferred_chat_preview',{})[chat_id]=old;store.save(fresh);return
+    if ok:
+        fresh.get('withdrawn_unreadable',{}).pop(chat_id,None);fresh.get('deferred_chat_preview',{}).pop(chat_id,None)
+    elif chat_id in fresh.get('deferred_chat_ids',[]):
+        person=bind_chat(fresh,row)
+        receiver=((person or {}).get('conversation',{}).get('receiver') or row.get('receiver') or '')[:100]
+        fresh.setdefault('withdrawn_unreadable',{})[chat_id]={'at':time.time(),'receiver':receiver}
+        from .logbook import log
+        log('state',type='withdrawn_chat_unreadable',case_id=case['id'],chat_id=chat_id)
+    store.save(fresh)
+
+
 async def sync_and_follow(manager,job,session,case):
     store=manager.cases
     from .selection_recovery import unresolved
@@ -498,7 +574,9 @@ async def sync_and_follow(manager,job,session,case):
     # 待核验的原会话和简历申请一样，可能被虚拟列表滚出可视区。先滚出来再判断缺不缺。
     reveal=[]
     # 隔离会话到了复核时间也要滚出来；滚不出来就永远等不到复核，岗位会一直暂缓新开聊。
-    deferred_due=case.get('deferred_chat_ids',[]) if time.time()>=case.get('deferred_chat_check_at',0) else []
+    # 已撤下岗位的放下会话不按时复核（11-27 旧 QE：约 7 条旧会话认不出，每约 15 分钟复核一次、次次失败），只在列表摘要变化时复核。
+    withdrawn=withdrawn_case(manager,case['id'])
+    deferred_due=case.get('deferred_chat_ids',[]) if time.time()>=case.get('deferred_chat_check_at',0) and not withdrawn else []
     for chat_id in [*resume_offers, *pending_chat_ids, *deferred_due]:
         if chat_id and chat_id not in reveal:reveal.append(chat_id)
     rows=await boss_chat.include_chat_rows(session,rows,reveal)
@@ -522,13 +600,14 @@ async def sync_and_follow(manager,job,session,case):
             store.audit(fresh,'chat_back_in_list',chat_id=row['chat_id'],reason='会话重新出现在沟通列表里，恢复正常处理')
             case=store.load(case['id'])
         if row['chat_id'] in case.get('deferred_chat_ids',[]):
-            if time.time() >= case.get('deferred_chat_check_at',0):
+            if withdrawn:
+                await _recheck_withdrawn_chat(manager,job,session,case,row)
+            elif time.time() >= case.get('deferred_chat_check_at',0):
                 await recheck_deferred_chat(manager,job,session,case,row)
             continue
         await manager.checkpoint(job)
         case=store.load(case['id']);c=bind_chat(case,row)
-        preview=re.sub(r'\b\d{1,2}:\d{2}\b|刚刚|\d+分钟前','',row.get('text',''))
-        row_hash=hashlib.sha256(json.dumps([preview,row.get('unread',False)],ensure_ascii=False).encode()).hexdigest()
+        row_hash=_row_hash(row)
         from .followup import evaluate as nudge_evaluate
         nudge_status=nudge_evaluate(case,c) if c else {}
         nudge_due=bool(c and (nudge_status.get('due') or (nudge_status.get('state')=='exhausted' and c.get('followup_state',{}).get('state')!='exhausted')))
@@ -666,16 +745,32 @@ async def _set_aside_changed_profile(manager,job,session,case_id,cid,exc):
 
 
 async def first_contact(manager,job,session,case):
-    """开一次首聊。返回 'contacted'（已提交）、'no_candidates'（推荐页已打开，本次没有可联系的卡片：空列表或全部被已联系、筛选排除）
+    """开一次首聊。返回 'contacted'（已提交）、'no_candidates'（推荐页已打开，本次没有可联系的卡片：空列表或全部被已联系、筛选排除）、
+    'screened_out'（本批至少打开 1 位，且打开的全部被首聊前初筛判为不符合必须项或初筛暂不可用）、
+    'views_exhausted'（今天打开资料已到上限，本岗位今天不再审阅推荐）
     或 'blocked'（额度、开关、话术、评估上限、资料变化、模型暂缓等其他原因）。"""
     store=manager.cases
     if not case.get('autonomy',{}).get('enabled'):return 'blocked'
     policy_revision=case['autonomy']['revision']
     task=effective_task(manager.db,case['id']) if getattr(manager,'db',None) is not None else None
     # 寻访任务：账号上限、任务当天目标与岗位权重份额共同决定；无任务（旧命令行）时按岗位自己的上限
-    if task and 'execution' in task['config']:
+    quota_task=task if task and 'execution' in task['config'] else None
+    if quota_task:
         if not job_quota.allowed(store,task,case['id'],day_key()):return 'blocked'
     elif daily_attempts(store,'first_contact')>=daily_new_target(case):return 'blocked'
+
+    def views_exhausted():
+        # 每账号每天打开资料有上限（账号合计，且按岗位权重分份额），到上限本岗位当天不再审阅推荐。
+        noted=job.get('profile_view_cap_noted') if isinstance(job.get('profile_view_cap_noted'),dict) else {}
+        today=list(noted.get(day_key()) or [])
+        if case['id'] not in today:
+            job['profile_view_cap_noted']={day_key():today+[case['id']]}
+            log('state',type='profile_view_cap',case_id=case['id'],task_id=quota_task.get('id'),actor='executor',reason='daily_profile_view_cap')
+            manager.event(job,'step','今天打开资料已到上限，本岗位今天不再审阅推荐')
+        return 'views_exhausted'
+    # 打开资料额度与推荐卡片无关：到上限就不再进入推荐页；本次调用内按打开次数递减，不逐张重算。
+    views_left=job_quota.views_remaining(store,quota_task,case['id'],day_key()) if quota_task else None
+    if views_left is not None and views_left<=0:return views_exhausted()
     # Start every automatic batch with a fresh read. A proof inherited from a
     # previous task may have only seconds left even though it is still valid.
     session._boss_greeting=None
@@ -683,7 +778,44 @@ async def first_contact(manager,job,session,case):
     if not await ensure_greeting(manager,job,session,case):return 'blocked'
     case=store.load(case['id'])
     pool=await open_list(session,case)
-    reviewed=0;index=0;review_limit=random.randint(*FIRST_CONTACT_REVIEWS_PER_BATCH)
+    reviewed=rejected=failed=0;index=0;review_limit=random.randint(*FIRST_CONTACT_REVIEWS_PER_BATCH)
+    from . import screening
+    from .job_sourcing import must_haves_revision
+
+    async def move_on(case,card):
+        """放下当前这一位：停留片刻后关弹层，在当前列表接着看；确认不了就重新进入推荐列表。返回 (pool,index)。"""
+        # 像人一样在资料上停留一段右偏分布的随机时长再离开，避免“打开即关闭”的固定节奏。
+        await asyncio.sleep(lognormal(7,0.5,2.5,25))
+        await manager.checkpoint(job)
+        # 优先像真人一样关闭弹层、在当前列表接着往下看，避免每跳过一位都整页重载并重新筛选；
+        # 只有确认弹层已关闭且仍是本岗位普通推荐时才继续，否则退回重新进入推荐列表。
+        fresh_cards=None
+        if await close_profile(session):
+            try:
+                await verify_list(session,job_identity(case),case['job']['label'])
+                fresh_cards=await read_cards(session)
+            except SourcingError:
+                fresh_cards=None
+        if fresh_cards:
+            ids=[x['geek_id'] for x in fresh_cards]
+            manager.event(job,'step','已关闭资料弹层，在当前推荐列表继续')
+            return fresh_cards,ids.index(card['geek_id'])+1 if card['geek_id'] in ids else 0
+        manager.event(job,'step','未确认资料弹层已关闭，重新进入推荐列表')
+        return await open_list(session,case),0
+
+    def screening_record(**fields):
+        """执行器记录上当天各岗位初筛连续失败次数（只保留当天）；成功时更新 last_ok_at 并清零。"""
+        day=day_key();daily=job.get('screening_failures');counts=daily.get(day) if isinstance(daily,dict) else None
+        counts=counts if isinstance(counts,dict) else {}
+        entry=counts.get(case['id']) if isinstance(counts.get(case['id']),dict) else {'n':0}
+        entry={**entry,**fields}
+        if 'last_failed_at' in fields:entry['n']=int(entry.get('n') or 0)+1
+        if 'last_ok_at' in fields:entry['n']=0
+        job['screening_failures']={day:{**counts,case['id']:entry}}
+        if hasattr(manager,'persist'):manager.persist(job)
+
+    def screened_out():
+        return reviewed>0 and rejected+failed==reviewed
     while index<len(pool):
         card=pool[index];index+=1
         await manager.checkpoint(job)
@@ -697,8 +829,14 @@ async def first_contact(manager,job,session,case):
         # 刚被判定暂不联系或决策暂缓的候选人，冷却期内不再打开详情，直接看下一张卡片。
         if c and max(c.get('decision_wait_until',0),c.get('decision_hold',{}).get('retry_at',0))>time.time():continue
         if (getattr(session,'_outreach_set_aside',None) or {}).get(card['geek_id'],0)>time.time():continue
+        # 按当前必须项版本已判为不符合的人不再打开资料；必须项改动后版本变化，会重新初筛。
+        must=(case.get('job_sourcing') or {}).get('must_haves') or []
+        if must and c and (c.get('screening') or {}).get('revision')==must_haves_revision(must) and c['screening'].get('outcome')=='reject':continue
         # 每批最多评估若干位，避免连续跳过时长时间浏览详情、反复调用模型。
-        if reviewed>=review_limit:return 'blocked'
+        if reviewed>=review_limit:return 'screened_out' if screened_out() else 'blocked'
+        if views_left is not None:
+            if views_left<=0:return views_exhausted()
+            views_left-=1
         reviewed+=1
         try:
             await open_profile(session,card['geek_id'],job_identity(case),case['job']['label'])
@@ -710,9 +848,42 @@ async def first_contact(manager,job,session,case):
         profile={**card,'display_name':c['profile'].get('display_name') if c else '候选人 '+str(len(case['candidates'])+1),
                  'job_id':job_identity(case),'source_channel':'recommend','review_card_sha256':card_fingerprint(card)}
         c=store.add_candidate(case,cid,RECOMMEND_URL,profile)
+        previous_review=c.get('profile_reviewed_at');c['profile_reviewed_at']=time.time();store.save(case)
         if any(m['status'] in ('draft','approved') for m in c['outbox']):
             store._invalidate(c)
             store.audit(case,'draft_superseded',candidate_id=cid,reason='新的只读核对替换尚未发送的旧草稿')
+        must=(case.get('job_sourcing') or {}).get('must_haves') or []
+        if must:
+            # 首聊前初筛：用 open_profile 已读到的经历概览，脱敏后逐条对照必须项；任何失败只放下这一位。
+            overview=(getattr(session,'_boss_recommend_detail',None) or {}).get('overview') or ''
+            name=c['profile'].get('display_name','候选人')
+            try:
+                result=await screening.screen(manager,case,c,overview)
+            except Exception as exc:
+                reason=str(exc)[:60] if isinstance(exc,screening.ScreeningUnavailable) else '初筛出错：'+type(exc).__name__
+                failed+=1
+                if views_left is not None:views_left+=1
+                case=store.load(case['id']);c=store.candidate(case,cid)
+                c['decision_wait_until']=time.time()+jitter(1800)
+                # 初筛没做成不算这一位今天的审阅，模型故障不消耗打开资料额度。
+                if previous_review is None:c.pop('profile_reviewed_at',None)
+                else:c['profile_reviewed_at']=previous_review
+                store.save(case)
+                screening_record(last_failed_at=time.time(),reason=reason)
+                log('state',type='precontact_screening_unavailable',case_id=case['id'],candidate_id=cid,actor='executor',reason=reason)
+                manager.event(job,'step',f'初筛暂不可用（{reason}），先放下这一位')
+                pool,index=await move_on(case,card);continue
+            screening_record(last_ok_at=time.time())
+            case=store.load(case['id']);c=store.candidate(case,cid);c['screening']=result
+            if result['outcome']=='reject':
+                rejected+=1
+                store.audit(case,'precontact_screening',candidate_id=cid,outcome='reject',items=result['items'])
+                texts={str(v['id']):v['text'] for v in must}
+                miss=next((i for i in result['items'] if i['verdict']=='unmet'),{})
+                unmet=texts.get(miss.get('id'),'') or miss.get('evidence','')
+                manager.event(job,'step',f'{name} 不符合本岗位必须项'+(f'（{unmet}）' if unmet else '')+'，不开聊，继续查看下一张推荐卡片')
+                pool,index=await move_on(case,card);continue
+            store.save(case)
         # 11-26 管理员决定“照写不拦”：首聊记录用本任务的问候语；BOSS 实际发出的是该岗位现有招呼语（写入成功时二者一致）。
         from .greeting_policy import render as render_greeting
         text=render_greeting(case['desired_greeting'],case) if case.get('desired_greeting') else case.get('platform_greeting_text')
@@ -724,25 +895,7 @@ async def first_contact(manager,job,session,case):
             # 被跳过者的资料弹层仍打开，直接打开下一位会被收件人一致性校验拦截，须先关闭弹层；
             # 被跳过者处于冷却期，重新遍历时会在上方被过滤。
             manager.event(job,'step',c['profile'].get('display_name','候选人')+' 暂不联系，继续查看下一张推荐卡片')
-            # 像人一样在资料上停留一段右偏分布的随机时长再离开，避免“打开即关闭”的固定节奏。
-            await asyncio.sleep(lognormal(7,0.5,2.5,25))
-            await manager.checkpoint(job)
-            # 优先像真人一样关闭弹层、在当前列表接着往下看，避免每跳过一位都整页重载并重新筛选；
-            # 只有确认弹层已关闭且仍是本岗位普通推荐时才继续，否则退回重新进入推荐列表。
-            fresh_cards=None
-            if await close_profile(session):
-                try:
-                    await verify_list(session,job_identity(case),case['job']['label'])
-                    fresh_cards=await read_cards(session)
-                except SourcingError:
-                    fresh_cards=None
-            if fresh_cards:
-                ids=[x['geek_id'] for x in fresh_cards]
-                pool=fresh_cards;index=ids.index(card['geek_id'])+1 if card['geek_id'] in ids else 0
-                manager.event(job,'step','已关闭资料弹层，在当前推荐列表继续')
-            else:
-                manager.event(job,'step','未确认资料弹层已关闭，重新进入推荐列表')
-                pool=await open_list(session,case);index=0
+            pool,index=await move_on(case,card)
             continue
         if not harness_id:return 'blocked'
         case=store.load(case['id']);c=store.candidate(case,cid)
@@ -778,7 +931,7 @@ async def first_contact(manager,job,session,case):
         store.confirm_delivery(case,cid,message['id'],{'evidence':'目标岗位和候选人已核验，打招呼点击正常返回',
                               'delivery_status':'submitted'},submission_only=True)
         return 'contacted'
-    return 'no_candidates'
+    return 'screened_out' if screened_out() else 'no_candidates'
 
 
 async def run_autopilot(manager,job,session):
@@ -1225,6 +1378,17 @@ async def run_account_executor(manager,job,session):
                     from .logbook import log
                     log('state',type='outreach_exhausted',case_id=cid,task_id=member['id'],actor='executor',reason='no_candidates')
                     manager.event(job,'step','该岗位今天推荐页暂无可联系的人，额度让给其他岗位')
+                if outcome=='views_exhausted':
+                    # 今天打开资料已到上限（first_contact 已发事件）：本岗位当天不再进入推荐页，剩余首聊额度让给其他岗位，次日恢复。
+                    drained.append(cid);job['outreach_exhausted']={day:drained};manager.persist(job)
+                    from .logbook import log
+                    log('state',type='outreach_exhausted',case_id=cid,task_id=member['id'],actor='executor',reason='profile_view_cap')
+                if outcome=='screened_out':
+                    # 本批打开的人都不符合必须项或初筛暂不可用：先让其他岗位开聊，约 30 分钟后再看；不算今天没人可联系，不让出当天额度。
+                    due[cid]=max(due.get(cid,0),time.time()+jitter(1800))
+                    from .logbook import log
+                    log('state',type='outreach_screened_out',case_id=cid,task_id=member['id'],actor='executor',reason='all_reviewed_rejected_or_unscreened')
+                    manager.event(job,'step','该岗位本批审阅的人不符合必须项或初筛暂不可用，先让其他岗位开聊，约 30 分钟后再看')
                 due.setdefault(cid,0)
                 due[cid]=max(due[cid],time.time()+jitter(30))
         for member in manager.account_execution.members():

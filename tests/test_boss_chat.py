@@ -34,9 +34,9 @@ async def test_intervening_reply_prevents_typing_and_send(monkeypatch):
  class Session:
   async def click(self,*a):actions.append('click')
   async def type_text(self,*a,**kw):actions.append('type')
- with pytest.raises(SourcingError):
+ with pytest.raises(bc.SendAborted) as caught:
   await bc.send_once(Session(),{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',{'fingerprint':'old'})
- assert not actions
+ assert not actions and caught.value.reason=='changed_before_typing' and caught.value.typed is False
 
 
 @pytest.mark.asyncio
@@ -600,3 +600,105 @@ async def test_menu_is_scrolled_to_the_top_before_rows_are_read(monkeypatch):
  monkeypatch.setattr(bc,'_observation',observation);monkeypatch.setattr(bc,'evaluate',evaluate);monkeypatch.setattr(bc.asyncio,'sleep',no_sleep)
  rows=await bc.open_menu(NS(page=NS(url=bc.CHAT_URL)))
  assert order[0]=='top' and [r['chat_id'] for r in rows]==['1-0']
+
+
+def _abort_world(monkeypatch,editor_after,*,fresh_fp='g',clear_raises=False,pre_send=None):
+ # 11-27 10:28 赵清山：打完字发现候选人刚回消息，按设计中止；自己打的字不能留在输入框里。
+ before={'fingerprint':'f','messages':[],'editor_count':1}
+ box={'value':''}
+ reads=iter([{**before,'valid':True},{**before,'fingerprint':fresh_fp,'valid':True,'editor_value':editor_after}])
+ async def read(session,chat_id,receiver,job_title,**kw):
+  try:data=next(reads)
+  except StopIteration:data={**before,'valid':True,'editor_value':box['value']}
+  if 'editor_value' in data and data is not None and data.get('fingerprint')==fresh_fp:box['value']=data['editor_value']
+  return data
+ async def observe(*a,**kw):return NS(elements=[NS(label='发送',raw={},index=3,tag='button')])
+ class Editor:
+  async def count(self):return 1
+  async def inner_text(self):return ''
+  async def fill(self,value,**kw):
+   if clear_raises and value=='':raise RuntimeError('fill failed')
+   box['value']=value
+ async def act(kind,fn):await fn()
+ clicks=[]
+ async def click(index):clicks.append(index)
+ monkeypatch.setattr(bc,'read_conversation',read);monkeypatch.setattr(bc,'_observation',observe)
+ session=NS(page=NS(locator=lambda s:Editor()),_act=act,click=click)
+ return session,before,box,clicks
+
+
+async def test_reply_during_typing_clears_own_text_and_raises_aborted(monkeypatch):
+ session,before,box,clicks=_abort_world(monkeypatch,'正文')
+ with pytest.raises(bc.SendAborted) as caught:
+  await bc.send_once(session,{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',before)
+ e=caught.value
+ assert e.reason=='reply_during_typing' and e.typed and e.cleared and box['value']=='' and clicks==[]
+
+
+async def test_abort_keeps_editor_when_text_differs(monkeypatch):
+ session,before,box,clicks=_abort_world(monkeypatch,'正文\n')
+ with pytest.raises(bc.SendAborted) as caught:
+  await bc.send_once(session,{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',before)
+ assert caught.value.typed and caught.value.cleared is False and box['value']=='正文\n' and clicks==[]
+
+
+async def test_abort_reports_not_cleared_when_clear_fails(monkeypatch):
+ session,before,box,clicks=_abort_world(monkeypatch,'正文',clear_raises=True)
+ with pytest.raises(bc.SendAborted) as caught:
+  await bc.send_once(session,{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',before)
+ assert caught.value.cleared is False and box['value']=='正文' and clicks==[]
+
+
+async def test_pre_send_refusal_clears_and_raises_aborted(monkeypatch):
+ session,before,box,clicks=_abort_world(monkeypatch,'正文',fresh_fp='f')
+ def refuse():raise SourcingError('岗位任务已暂停，未点击发送')
+ with pytest.raises(bc.SendAborted) as caught:
+  await bc.send_once(session,{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',before,pre_send=refuse)
+ assert caught.value.reason=='not_authorized' and caught.value.cleared and box['value']=='' and clicks==[]
+
+
+async def test_reread_failure_after_typing_aborts_and_clears(monkeypatch):
+ # 评审：打字后、点击前读取失败也一定没发出，同样删掉自己的字。
+ session,before,box,clicks=_abort_world(monkeypatch,'正文',fresh_fp='f')
+ calls=[]
+ async def observe(*a,**kw):
+  calls.append(1)
+  if len(calls)>1:raise RuntimeError('observe failed')
+  return NS(elements=[])
+ monkeypatch.setattr(bc,'_observation',observe)
+ class Editor:
+  async def count(self):return 1
+  async def inner_text(self):return ''
+  async def fill(self,value,**kw):box['value']=value
+ session.page=NS(locator=lambda s:Editor())
+ with pytest.raises(bc.SendAborted) as caught:
+  await bc.send_once(session,{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',before)
+ assert caught.value.reason=='reread_failed' and caught.value.cleared and clicks==[]
+
+
+async def test_clear_uses_tidy_when_session_has_it(monkeypatch):
+ # 评审：任务刚暂停时 _act 会拒绝操作；删自己的字走 _tidy（只在管理员接管时拒绝）。
+ session,before,box,clicks=_abort_world(monkeypatch,'正文',fresh_fp='f')
+ async def refuse_act(kind,fn):
+  if box['value']:raise SourcingError('岗位任务已暂停，取消后续页面操作')
+  await fn()
+ tidy=[]
+ async def tidy_act(kind,fn):tidy.append(kind);await fn()
+ session._act=refuse_act;session._tidy=tidy_act
+ def refuse():raise SourcingError('岗位任务已暂停，未点击发送')
+ with pytest.raises(bc.SendAborted) as caught:
+  await bc.send_once(session,{'chat_id':'12-0','receiver':'甲','job_title':'岗位'},'正文',before,pre_send=refuse)
+ assert caught.value.cleared and tidy==['type'] and box['value']==''
+
+
+def test_identity_reader_reports_header_job_field():
+ # 11-27 旧 QE 岗位撤下后约 7 条旧会话都报“详情头部未匹配目标岗位”：诊断里要看得到头部实际写的沟通职位。
+ assert 'header_jobs' in bc.IDENTITY_READER_JS
+
+
+async def test_header_job_mismatch_reports_observed_job_field(monkeypatch):
+ async def evaluate(*a):return {'valid':False,'reason':'会话收件人或岗位未核实','reason_code':'header_job_unverified',
+                               'evidence':{'header_jobs':['QE工程师（已关闭）'],'header_candidates':1}}
+ monkeypatch.setattr(bc,'evaluate',evaluate)
+ with pytest.raises(bc.ChatSelectionUnavailable) as caught:await bc.read_conversation(object(),'12-0','甲','QE工程师')
+ assert caught.value.diagnostics['header_jobs']==['QE工程师（已关闭）']

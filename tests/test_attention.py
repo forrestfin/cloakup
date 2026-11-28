@@ -418,6 +418,55 @@ def test_task_not_validated_skips_version_mismatch(tmp_path,monkeypatch):
     assert not [t for t in s.reconcile([],[]) if t['kind'] in ('task_not_validated','job_not_validated')]
 
 
+
+# 11-27 首聊前初筛：同一岗位当天初筛失败 ≥3 次且之后没有成功过 → 待办；之后一次成功或跨天自动解除。
+def test_screening_unavailable_todo_opens_and_closes(tmp_path):
+    from cloakup.autonomy import day_key
+    db=Database(tmp_path);s=AttentionStore(db);cases=[_job_case('a','数据顾问')]
+    today=day_key();kind=lambda todos:[t for t in todos if t['kind']=='screening_unavailable']
+    old={'id':'r0','status':'failed','account_runner':True,'created':1,'screening_failures':{today:{'a':{'n':1,'last_failed_at':100.0}}}}
+    run={'id':'r1','status':'running','account_runner':True,'created':2,'screening_failures':{today:{'a':{'n':1,'last_failed_at':200.0}}}}
+    assert not kind(s.reconcile([old,run],cases))  # n=2 不提醒
+    run['screening_failures'][today]['a']['n']=2  # 重启前后的执行器记录合计当天次数
+    [todo]=kind(s.reconcile([old,run],cases))
+    assert todo['id'] and todo['case_id']=='a' and todo['title']=='岗位初筛暂不可用'
+    assert todo['detail']=='岗位「数据顾问」今天首聊前初筛已连续失败 3 次。已做：失败的候选人先放下、稍后再看，其他工作照常，没有向候选人发消息。需要：查看模型网关是否可用、执行浏览器里推荐牛人详情能否打开；恢复后此待办自动解除。'
+    run['screening_failures'][today]['a']['reason']='没有取到推荐页详情，只凭卡片不初筛'  # 11-27：待办写明最近一次原因，便于区分网关和页面问题
+    [todo]=kind(s.reconcile([old,run],cases))
+    assert '（最近一次：没有取到推荐页详情，只凭卡片不初筛）。已做' in todo['detail']
+    with pytest.raises(ValueError):s.update(todo['id'],{'status':'resolved','note':'x'})  # 只随状态自动解除，不能手动关闭
+    old['screening_failures'][today]['a']['last_ok_at']=300.0  # 另一条运行记录里的成功也算
+    assert [t['status'] for t in kind(s.reconcile([old,run],cases))]==['resolved']
+    run['screening_failures'][today]['a']['last_failed_at']=400.0  # 成功后只又失败一次：不算连续 3 次
+    assert [t['status'] for t in kind(s.reconcile([old,run],cases))]==['resolved']
+    run['screening_failures'][today]['a'].update(n=3,last_failed_at=500.0)  # 成功后又连续失败 3 次：再次提醒
+    assert [t['status'] for t in kind(s.reconcile([old,run],cases))]==['pending']
+    old['screening_failures']={'2000-01-01':{'a':{'n':9,'last_failed_at':500.0}}};run['screening_failures']={'2000-01-01':{'a':{'n':9,'last_failed_at':500.0}}}
+    assert [t['status'] for t in kind(s.reconcile([old,run],cases))]==['resolved']  # 跨天自动解除
+
+
+def test_screening_unavailable_todo_not_reopened_by_single_failure_after_recovery(tmp_path):
+    # 11-27 终审：计数是“连续失败”。失败 3 次 → 成功（计数清零）→ 再失败 1 次，不再提醒。
+    from cloakup.autonomy import day_key
+    s=AttentionStore(Database(tmp_path));cases=[_job_case('a','数据顾问')];today=day_key()
+    kind=lambda todos:[t for t in todos if t['kind']=='screening_unavailable']
+    run={'id':'r','status':'running','account_runner':True,'created':1,'screening_failures':{today:{'a':{'n':3,'last_failed_at':100.0}}}}
+    assert [t['status'] for t in kind(s.reconcile([run],cases))]==['pending']
+    run['screening_failures'][today]['a']={'n':1,'last_failed_at':300.0,'last_ok_at':200.0}  # 执行器在成功时把 n 清零，之后只失败 1 次
+    assert [t['status'] for t in kind(s.reconcile([run],cases))]==['resolved']
+    # 另一条（重启前）记录里的失败早于最新成功，不计入连续次数。
+    old={'id':'r0','status':'failed','account_runner':True,'created':0,'screening_failures':{today:{'a':{'n':5,'last_failed_at':150.0}}}}
+    assert [t['status'] for t in kind(s.reconcile([old,run],cases))]==['resolved']
+
+
+@pytest.mark.parametrize('value',['oops',['a'],{'TODAY':'bad'},{'TODAY':{'a':'3'}},{'TODAY':{'a':{'n':'3','last_failed_at':1}}},{'TODAY':{'a':{'n':3,'last_failed_at':None}}}])
+def test_malformed_screening_failures_do_not_break_reconcile(tmp_path,value):
+    from cloakup.autonomy import day_key
+    s=AttentionStore(Database(tmp_path))
+    if isinstance(value,dict):value={day_key() if k=='TODAY' else k:v for k,v in value.items()}
+    run={'id':'r','status':'running','account_runner':True,'created':1,'screening_failures':value}
+    assert not [t for t in s.reconcile([run],[]) if t['kind']=='screening_unavailable']
+
 @pytest.mark.parametrize('value',['oops',['a'],{'TODAY':'bad'},{'TODAY':{'a':'3'}},{'TODAY':None}])
 def test_malformed_outreach_deferrals_do_not_break_reconcile(tmp_path,value):
     from cloakup.autonomy import day_key
@@ -563,3 +612,36 @@ def test_failed_resume_archive_raises_todo_until_archived(tmp_path):
  assert len(todos)==1 and todos[0]['title']=='简历未能归档' and todos[0]['status']=='pending' and '未取得唯一PDF原文件' in todos[0]['detail']
  person['resume_archives']['platform-message:m1']={'status':'interrupted','at':2}
  assert [t for t in store.reconcile([], [c]) if t['kind']=='resume_archive'][0]['status']=='resolved'
+
+
+def test_draft_todo_names_system_own_unsent_text(tmp_path):
+ # 11-27 10:43：暂停原因是系统自己没删掉的文字，待办要说清是谁的会话、可以直接删。
+ import time
+ db=Database(tmp_path);store=AttentionStore(db)
+ run={'id':'r','status':'running','created':1,'selection_recovery':{'c':{'task_id':'task','incident_id':'i','status':'blocked','attempts':3,'max_attempts':3,
+      'updated_at':1,'diagnostics':{'stage':'recover_guard','reason':'draft_present','exception_type':None}}}}
+ db.put('system_draft','boss',{'id':'boss','chat_id':'733-0','receiver':'赵清山','job_label':'qe工程师','case_id':'c','text':'好的，谢谢您！','at':time.time()-60})
+ todo=store.reconcile([run],[])[0]
+ for word in ('系统自己没发出的文字','赵清山','qe工程师','「好的，谢谢您！」','确认后删除即可继续','不是这段文字'):assert word in todo['detail']
+ db.put('system_draft','boss',{'id':'boss','chat_id':'733-0','receiver':'赵清山','job_label':'qe工程师','case_id':'c','at':time.time()-25*3600})
+ todo=store.reconcile([run],[])[0]
+ assert '系统自己' not in todo['detail']
+
+
+def test_withdrawn_unreadable_chat_raises_todo_until_verified(tmp_path):
+ # 11-27 旧 QE 岗位：撤下后旧会话认不出，候选人来了新消息也没人回，交给人工。
+ store=AttentionStore(Database(tmp_path))
+ case={'id':'c'*32,'job':{'label':'QE工程师'},'candidates':{},'deferred_chat_ids':['626363397-0'],'withdrawn_unreadable':{'626363397-0':{'at':1,'receiver':'朱奇'}}}
+ todo=next(t for t in store.reconcile([],[case]) if t['kind']=='withdrawn_chat')
+ assert todo['title']=='旧岗位会话需人工回复' and todo['status']=='pending' and todo['job_label']=='QE工程师'
+ for word in ('朱奇','QE工程师','不会自动回复','在 BOSS 手动回复'):assert word in todo['detail']
+ case['withdrawn_unreadable']={}
+ assert next(t for t in store.reconcile([],[case]) if t['id']==todo['id'])['status']=='resolved'
+
+
+def test_withdrawn_todo_only_for_chats_still_parked(tmp_path):
+ store=AttentionStore(Database(tmp_path))
+ case={'id':'c'*32,'job':{'label':'QE工程师'},'candidates':{},'deferred_chat_ids':['1-0'],
+       'withdrawn_unreadable':{'1-0':{'at':1,'receiver':'甲'},'2-0':{'at':1,'receiver':'乙'}}}
+ todos=[t for t in store.reconcile([],[case]) if t['kind']=='withdrawn_chat']
+ assert len(todos)==1 and '甲' in todos[0]['detail']

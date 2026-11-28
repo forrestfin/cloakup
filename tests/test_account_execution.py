@@ -264,6 +264,29 @@ async def test_exhausted_job_yields_to_others_until_next_day(tmp_path,monkeypatc
  assert 'a' in calls and today not in env.job['outreach_exhausted']
 
 
+async def test_screened_out_job_yields_for_now_but_not_for_the_day(tmp_path,monkeypatch):
+ # 11-27 首聊前初筛：a 本批审阅的人都不符合必须项，先让 b 开聊、约 30 分钟后再看 a；不算“今天没人可联系”，不让出当天额度。
+ from cloakup import autopilot as ap,logbook
+ logged=[];monkeypatch.setattr(logbook,'log',lambda *a,**kw:logged.append(kw))
+ env=_outreach_env(tmp_path,monkeypatch,[('t1',[_job('a'),_job('b')],4)],[4],lambda cid:'screened_out' if cid=='a' else 'contacted')
+ # 替身时钟每次 sleep 前进很多；把 30 分钟的让位放大，确认让位期间 a 不再被选中。
+ waits=[];monkeypatch.setattr(ap,'jitter',lambda s,*a:waits.append(s) or (s*10**4 if s==1800 else s))
+ await env.run()
+ assert 1800 in waits and env.attempts.count('a')==1 and env.contacts==['b','b']
+ assert not env.job.get('outreach_exhausted')
+ assert env.events.count('该岗位本批审阅的人不符合必须项或初筛暂不可用，先让其他岗位开聊，约 30 分钟后再看')==1
+ assert any(e.get('type')=='outreach_screened_out' and e.get('case_id')=='a' and e.get('task_id')=='t1' and e.get('actor')=='executor' and e.get('reason')=='all_reviewed_rejected_or_unscreened' for e in logged)
+
+
+async def test_view_cap_drains_job_for_the_rest_of_the_day(tmp_path,monkeypatch):
+ # 打开资料到当天上限：执行器当天不再为该岗位进入推荐页（不再调用首聊/打开列表），首聊额度让给其他岗位；次日恢复。
+ from cloakup import autopilot as ap
+ env=_outreach_env(tmp_path,monkeypatch,[('t1',[_job('a'),_job('b')],4)],[8],lambda cid:'views_exhausted' if cid=='a' else 'contacted')
+ await env.run()
+ assert env.attempts.count('a')==1 and env.contacts==['b']*4
+ assert env.job['outreach_exhausted']=={ap.day_key():['a']}
+
+
 async def test_withdrawn_job_still_syncs_inbox_but_no_outreach(tmp_path,monkeypatch):
  # 撤下的 b：收件照常同步与回复，从不进入首聊；额度全部给 a。
  env=_outreach_env(tmp_path,monkeypatch,[('t1',[_job('b',5,'withdrawn'),_job('a')],3)],[8])

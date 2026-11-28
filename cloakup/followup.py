@@ -47,7 +47,7 @@ def evaluate(case,person,now=None):
  now=time.time() if now is None else now;cfg=limits({**DEFAULTS,**case.get('execution',{})})
  incoming=next((m for m in reversed(person.get('inbox',[])) if not m.get('platform_control') and not is_permission_text(m.get('text',''))),None)
  anchor=incoming['external_id'] if incoming else 'initial'
- attempts=[m for m in person.get('outbox',[]) if m.get('decision',{}).get('nudge_anchor')==anchor and (m.get('claimed_at') or m['status'] in ('sending','sent','delivery_unknown'))]
+ attempts=[m for m in person.get('outbox',[]) if m.get('decision',{}).get('nudge_anchor')==anchor and not m.get('abort_reason') and (m.get('claimed_at') or m['status'] in ('sending','sent','delivery_unknown'))]
  state={'anchor':anchor,'attempts':len(attempts),'max_attempts':min(NO_REPLY_MAX_ATTEMPTS if anchor=='initial' else REPLIED_MAX_ATTEMPTS,cfg['nudge_max_attempts']),'state':'waiting','due':False,'delivery':'unverified','variants':[]}
  if person.get('resumes') or person.get('handoff') or person.get('status') in TERMINAL:return {**state,'state':'closed'}
  if not cfg['nudge_enabled'] or not case.get('execution',{}).get('follow_up',True):return {**state,'state':'disabled'}

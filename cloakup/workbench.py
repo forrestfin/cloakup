@@ -140,6 +140,12 @@ class WebSession(BrowserSession):
         self.manager.persist(self.job)
         return obs
 
+    async def _tidy(self, kind, fn):
+        """删掉自己刚打、没发出的文字：任务刚暂停也要收拾，否则留下的字恢复后又会暂停任务；管理员接管时不动页面。"""
+        if self.job.get('manual_takeover'):raise SourcingError('管理员接管中，未清理输入框')
+        self.manager.event(self.job, "action", f"浏览器操作：{kind}")
+        return await super()._act(kind, fn)
+
     async def _act(self, kind, fn):
         takeover_before=self.job.get('takeover_epoch',0)
         was_manual=self.job.get('manual_takeover',False)
@@ -557,7 +563,9 @@ class Workbench:
     async def snapshot(self):
         from .prompts import prompt_defaults
         from .action_gateway import ActionLedger
+        from .screening import stats as screening_stats
         from importlib.metadata import version,PackageNotFoundError
+        week=time.time()-7*86400  # 任务页“近 7 天初筛”统计行
         try:harness_version=version('deepseek-harness-sdk')
         except PackageNotFoundError:harness_version=None
         cases=self.cases.list();locks=locked_tasks(self.db,[c['id'] for c in cases])
@@ -570,7 +578,7 @@ class Workbench:
             "ui_version": str((ASSETS / "app.js").stat().st_mtime_ns),
             "definitions": self.definitions.list(), "readiness": self.latest_readiness(), "executor_checks": executor_checks, "database": self.db.backend, "runtime": "docker" if Path("/.dockerenv").exists() else "local",
             "capabilities": {"boss_first_contact": True, "boss_recommend": True, "boss_autopilot": True},
-            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c),"config_locked_by":locks.get(c['id']),"jd_review":jd_review(c)} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
+            "cases": [{**c,"editable_config":view_config(c),"anonymous_draft":draft_anonymous_job(c),"config_locked_by":locks.get(c['id']),"jd_review":jd_review(c),"screening_stats":screening_stats(c,week)} for c in self.cases.list()], "recipes": self.recipes(), "runs": [{"created":0,"params":{},"mode":"login","task":"历史浏览器恢复记录",**j,"can_recover_login":can_recover_login(j)} for j in sorted(self.jobs.values(), key=lambda j: j.get("created",0), reverse=True)],
             "busy": self.busy()["id"] if self.busy() else None})
 
     def today_view(self,cases):
@@ -1629,6 +1637,16 @@ def make_server(manager: Workbench, port: int = 8765):
                     from .job_changes import request as request_job_change
                     async def job_change_action():return request_job_change(manager,self.path.split('/')[3],body)
                     result=manager.call(job_change_action())
+                elif re.fullmatch(r'/api/tasks/[a-f0-9]{32}/must-haves/split',self.path):
+                    # 客户反馈拆成必须项草案，只预览不保存；保存走上面的岗位变更（action=must_haves）。
+                    from . import screening
+                    cid=body.get('case_id')
+                    if cid not in manager.definitions.get(self.path.split('/')[3])['config']['case_ids']:raise ValueError('岗位不属于当前任务')
+                    existing=(manager.cases.load(cid).get('job_sourcing') or {}).get('must_haves') or []
+                    async def split_action():
+                        try:return {'items':await screening.split_feedback(manager,body.get('text'),existing)}
+                        except screening.ScreeningUnavailable as exc:raise ValueError(str(exc)) from exc
+                    result=manager.call(split_action(),timeout=120)
                 elif re.fullmatch(r'/api/tasks/[a-f0-9]{32}/agent-workspace/(draft|session|chat|test|publish|todo)',self.path):
                     ident=self.path.split('/')[3];action=self.path.split('/')[-1]
                     async def workspace_action():

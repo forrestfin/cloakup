@@ -537,3 +537,58 @@ def test_state_lists_jd_review_per_case(manager):
         view=next(c for c in (await manager.snapshot())['cases'] if c['id']==case['id'])
         assert [(r['id'],r['text'],r['reason']) for r in view['jd_review']]==[('jd:0','直接向品质负责人汇报。',None),(None,'8-12K＋绩效奖金','含薪酬数字')]
     manager.call(scenario())
+
+
+def test_split_endpoint_previews_without_saving(manager, monkeypatch):
+    # 11-27 必须项：客户反馈拆成草案只预览，不写岗位；模型不可用、校验不过给 400 中文原因
+    from cloakup import screening
+    case=manager.cases.create('https://www.zhipin.com/web/chat/job-list');manager.cases.bind_job(case,{'title':'交付顾问','requirements':'支持远程协作。'})
+    case['job_sourcing']={'greeting':'您好','outreach_terms':[],'recommend_filters':[],'must_haves':[{'id':'mh_1','text':'本科及以上','source':'jd','note':'','added_at':1.0}]};manager.cases.save(case)
+    other=manager.cases.create('https://www.zhipin.com/web/chat/job-list?x=2')
+    task=manager.definitions.save({'config':{'name':'寻访任务','website':'https://www.zhipin.com/','scenario':'寻访','goal':'持续取得简历','engine':'boss_sourcing','case_ids':[case['id']]}})
+    seen=[];outcome={'raise':None}
+    async def split(m, text, existing, *, llm=None):
+        seen.append((text,existing))
+        if outcome['raise']:raise outcome['raise']
+        return [{'id':'mh_2','text':'有分布式系统研发经历','source':'client_feedback','note':text,'added_at':2.0}]
+    monkeypatch.setattr(screening,'split_feedback',split)
+    before=manager.cases.load(case['id'])
+    server = web.make_server(manager, 0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    def request(path, data=None, token=None):
+        req = urllib.request.Request(base+path, data=json.dumps(data).encode() if data is not None else None, headers={'X-Cloakup-Token': token} if token else {})
+        return json.load(urllib.request.urlopen(req))
+    path=f"/api/tasks/{task['id']}/must-haves/split"
+    try:
+        token = request('/api/state')['token']
+        with pytest.raises(urllib.error.HTTPError) as exc: request(path, {'case_id': case['id'], 'text': '要做过分布式'})
+        assert exc.value.code == 403 and not seen
+        result = request(path, {'case_id': case['id'], 'text': '要做过分布式'}, token)
+        assert result == {'items': [{'id':'mh_2','text':'有分布式系统研发经历','source':'client_feedback','note':'要做过分布式','added_at':2.0}]}
+        assert seen == [('要做过分布式', before['job_sourcing']['must_haves'])]
+        assert manager.cases.load(case['id'])['job_sourcing'] == before['job_sourcing'] and not manager.db.list('job_change')
+        for error, message in ((screening.ScreeningUnavailable('模型拆分客户反馈暂不可用或输出不合格'), '模型拆分客户反馈暂不可用或输出不合格'), (ValueError('每个岗位最多10条必须项'), '每个岗位最多10条必须项')):
+            outcome['raise'] = error
+            with pytest.raises(urllib.error.HTTPError) as exc: request(path, {'case_id': case['id'], 'text': '要做过分布式'}, token)
+            assert exc.value.code == 400 and json.load(exc.value)['error'] == message
+        with pytest.raises(urllib.error.HTTPError) as exc: request(path, {'case_id': other['id'], 'text': '要做过分布式'}, token)
+        assert exc.value.code == 400 and json.load(exc.value)['error'] == '岗位不属于当前任务'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_snapshot_cases_carry_week_screening_stats(manager):  # 11-27 Task 9：任务页必须项区块的“近 7 天初筛”统计行
+    import time
+    case=manager.cases.create('https://www.zhipin.com/web/chat/job/edit?encryptId=test')
+    manager.cases.bind_job(case,{'title':'交付顾问','requirements':'五年招聘经验'})
+    person=manager.cases.add_candidate(case,'p1','https://www.zhipin.com/web/chat/index',{'summary':'职业资料'})
+    person['profile_reviewed_at']=time.time()-3600
+    old=manager.cases.add_candidate(case,'p2','https://www.zhipin.com/web/chat/index',{'summary':'职业资料'})
+    old['profile_reviewed_at']=time.time()-8*86400
+    manager.cases.save(case)
+    view=next(c for c in manager.call(manager.snapshot())['cases'] if c['id']==case['id'])
+    assert view['screening_stats']['reviewed']==1 and view['screening_stats']['by_item']=={}

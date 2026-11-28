@@ -32,6 +32,12 @@ def test_edit_versions_effective_job_and_invalidates_old_message(data):
  s.set_autonomy(c,False,source='user');s.set_autonomy(c,True,source='user')
  assert c['autonomy']['daily_new_limit']==3
 
+def test_save_config_keeps_must_haves(data):
+ # 11-27 评审：保存沟通配置重建 job_sourcing 时只写三项，未锁定岗位的必须项被悄悄清空
+ s,c=data;c['job_sourcing']={'greeting':'您好','outreach_terms':[],'recommend_filters':[],'must_haves':[{'id':'mh_1','text':'有分布式经验','source':'jd','note':'','added_at':1.0}]};s.save(c)
+ save_config(s,c,body(c))
+ assert c['job_sourcing']['must_haves']==[{'id':'mh_1','text':'有分布式经验','source':'jd','note':'','added_at':1.0}]
+
 def test_new_jd_cannot_reuse_old_anonymous_model_facts(data):
  s,c=data;b=body(c);b['config']['jd']='新JD';save_config(s,c,b)
  assert c['anonymous_job'] is None

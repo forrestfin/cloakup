@@ -1,12 +1,14 @@
-"""运行中的寻访任务增量变更岗位：加入、撤下、恢复、移除、调权重、改每日首聊总额。
+"""运行中的寻访任务增量变更岗位：加入、撤下、恢复、移除、调权重、改每日首聊总额、更新必须项。
 
-闭环：管理员发起 -> 校验 -> （仅加入）只用新岗位的必需场景跑一次隔离验收 -> 排队 ->
+闭环：管理员发起 -> 校验 -> （加入、更新必须项）只用该岗位的必需场景跑一次隔离验收 -> 排队 ->
 执行器在每轮开始的安全点（未持有任何岗位数据、不在恢复核验轮次）基于当前生效版本重新组装，
 同一事务写入发布包、生效版本、任务、受影响岗位与运行中任务的绑定 -> 新版本按岗位逐项判定验收。
 
 加入的岗位快照在发起时生成一次并随验收保存，应用时原样并入，不从岗位现状重新派生；
 已有岗位的快照从当前生效版本复制。验收时的运行时签名、任务摘要或新岗位快照摘要与应用时不一致，
 变更失败并生成待办，不覆盖更新的版本。撤下只停新首聊，收件、回复、追聊、收简历照常。
+更新必须项只替换该岗位快照的 sourcing.must_haves：应用时以当前生效版本的岗位快照换上验收过的清单，
+其摘要须与验收时一致；不提升岗位自动化修订号、不清候选人决策，旧初筛结论按必须项修订号自然过期。
 """
 import copy
 import time
@@ -16,7 +18,7 @@ from . import job_members
 from .sourcing import TERMINAL
 
 KIND='job_change'
-ACTIONS={'add':'加入岗位','withdraw':'撤下岗位','resume':'恢复首聊','remove':'移除岗位','weights':'调整岗位权重','limit':'调整每日首聊总额'}
+ACTIONS={'add':'加入岗位','withdraw':'撤下岗位','resume':'恢复首聊','remove':'移除岗位','weights':'调整岗位权重','limit':'调整每日首聊总额','must_haves':'更新必须项'}
 OPEN=('testing','pending')
 UNCONFIGURED='请先确认该岗位的问候语、事实和寻访条件'
 
@@ -79,7 +81,10 @@ def request(manager,task_id,body):
     if action=='add':
         payload={'weight':_weight(body.get('weight',1))}
         case=_check_addable(manager,task_id,members,cid)
-    elif action in ('withdraw','resume','remove') and not member:raise ValueError('岗位不在任务中')
+    elif action in ('withdraw','resume','remove','must_haves') and not member:raise ValueError('岗位不在任务中')
+    elif action=='must_haves':
+        from .job_sourcing import checked_must_haves
+        payload={'must_haves':checked_must_haves(body.get('must_haves'))}
     elif action=='withdraw' and member['outreach']!='active':raise ValueError('该岗位已撤下')
     elif action=='resume' and member['outreach']!='withdrawn':raise ValueError('该岗位已在参与首聊')
     elif action=='remove':
@@ -96,17 +101,23 @@ def request(manager,task_id,body):
         payload={'limit':limit}
     now=time.time()
     record={'id':uuid.uuid4().hex,'task_id':task_id,'action':action,'case_id':cid,'payload':payload,'base_version_id':release['version_id'],'status':'pending','at':now}
-    if action=='add':
-        # 以生效版本派生：追加新岗位快照（只在此生成一次）与成员，只跑该岗位的必需场景。
+    if action in ('add','must_haves'):
         from .agent_workspace import source,source_digest
         bundle=copy.deepcopy(base['bundle'])
-        draft=copy.deepcopy(bundle);draft['sources'].append(source(case));draft['config']['case_ids']=[*member_ids,cid]
-        draft['config']['members']=[*members,{'case_id':cid,'weight':payload['weight'],'outreach':'active'}]
-        normalized=manager.agent_workspace.normalize(task_id,draft)  # 与整单草案同一套校验（事实、FAQ、寻访配置、任务归属）
-        bundle['sources'].append(next(i for i in normalized['sources'] if i['case_id']==cid))
-        bundle['config']['members']=copy.deepcopy(draft['config']['members']);bundle['config'].pop('case_ids',None);job_members.normalize(bundle['config'])
+        if action=='add':
+            # 以生效版本派生：追加新岗位快照（只在此生成一次）与成员，只跑该岗位的必需场景。
+            draft=copy.deepcopy(bundle);draft['sources'].append(source(case));draft['config']['case_ids']=[*member_ids,cid]
+            draft['config']['members']=[*members,{'case_id':cid,'weight':payload['weight'],'outreach':'active'}]
+            normalized=manager.agent_workspace.normalize(task_id,draft)  # 与整单草案同一套校验（事实、FAQ、寻访配置、任务归属）
+            bundle['sources'].append(next(i for i in normalized['sources'] if i['case_id']==cid))
+            bundle['config']['members']=copy.deepcopy(draft['config']['members']);bundle['config'].pop('case_ids',None);job_members.normalize(bundle['config'])
+        else:
+            # 以生效版本派生：只换该岗位快照的必须项，其余内容原样；整包走同一套校验后只取回必须项。
+            item=next(i for i in bundle['sources'] if i['case_id']==cid);item['sourcing']={**item['sourcing'],'must_haves':copy.deepcopy(payload['must_haves'])}
+            normalized=manager.agent_workspace.normalize(task_id,bundle)
+            item['sourcing']['must_haves']=copy.deepcopy(next(i for i in normalized['sources'] if i['case_id']==cid)['sourcing']['must_haves'])
         test=manager.agent_workspace.start_job_test(task_id,bundle,cid,job_change_id=record['id'])
-        record.update(status='testing',test_id=test['id'],source_digest=source_digest(case))
+        record.update(status='testing',test_id=test['id'],**({'source_digest':source_digest(case)} if action=='add' else {}))
         db.put(KIND,record['id'],record)
         worker=manager.agent_workspace.workers.get(test['id'])
         if worker is not None:worker.add_done_callback(lambda _task:_after_test(manager,record['id']))
@@ -127,7 +138,7 @@ def _after_test(manager,ident):
 
 
 def settle(manager):
-    """验收结束的加入请求：通过转 pending，未通过或被中断转 failed；仍在运行的保持 testing。"""
+    """验收结束的加入与更新必须项请求：通过转 pending，未通过或被中断转 failed；仍在运行的保持 testing。"""
     from .agent_workspace import incomplete_validation
     db=manager.db;moved=0
     for record in db.list(KIND):
@@ -139,7 +150,7 @@ def settle(manager):
         if test['status']=='passed' and not gap:record.update(status='pending',validated_at=time.time())
         else:
             outcomes=(test.get('result') or {}).get('outcomes') or []
-            reason=gap or test.get('error') or f"新岗位隔离验收未通过（{sum(bool(o.get('passed')) for o in outcomes)}/{len(outcomes)} 项通过）"
+            reason=gap or test.get('error') or f"{'新岗位' if record['action']=='add' else '该岗位'}隔离验收未通过（{sum(bool(o.get('passed')) for o in outcomes)}/{len(outcomes)} 项通过）"
             _fail(record,reason)
         db.put(KIND,record['id'],record);moved+=1
     return moved
@@ -179,7 +190,7 @@ def apply(manager,record):
     release,base=_current(manager,task_id);task=manager.definitions.get(task_id)
     bundle=copy.deepcopy(base['bundle']);cfg=bundle['config'];members=job_members.normalize(copy.deepcopy(cfg))
     member=next((m for m in members if m['case_id']==cid),None)
-    if action in ('withdraw','resume','remove') and not member:raise ValueError('岗位已不属于该任务的生效版本')
+    if action in ('withdraw','resume','remove','must_haves') and not member:raise ValueError('岗位已不属于该任务的生效版本')
     touched=[]
     if action=='add':
         test=db.get('agent_test',record['test_id'])
@@ -187,6 +198,12 @@ def apply(manager,record):
         if source_digest(manager.cases.load(cid))!=record.get('source_digest'):raise ValueError('岗位资料在验收后被修改，请重新发起加入')
         item=copy.deepcopy(next(i for i in test['bundle']['sources'] if i['case_id']==cid))
         bundle['sources'].append(item);members.append({'case_id':cid,'weight':record['payload']['weight'],'outreach':'active'})
+        touched=[cid]
+    elif action=='must_haves':
+        # 以当前生效版本的岗位快照换上验收过的必须项；快照其余部分若在验收后变了，下面的覆盖校验会拒绝。
+        test=db.get('agent_test',record['test_id'])
+        item=next(i for i in bundle['sources'] if i['case_id']==cid)
+        item['sourcing']={**item['sourcing'],'must_haves':copy.deepcopy(next(i for i in test['bundle']['sources'] if i['case_id']==cid)['sourcing']['must_haves'])}
         touched=[cid]
     elif action=='withdraw':member['outreach']='withdrawn'
     elif action=='resume':member['outreach']='active'
@@ -207,17 +224,18 @@ def apply(manager,record):
     else:cfg.pop('removed_today',None)
     cfg['members']=members;cfg.pop('case_ids',None);job_members.normalize(cfg)
     if task_digest(bundle)!=task_digest(base['bundle']):raise ValueError('岗位变更不能改变任务级设置')
-    if action=='add':
-        # 新岗位的验收必须对应应用时的运行时、任务设置与这份岗位快照，并通过与发布相同的门槛。
+    if action in ('add','must_haves'):
+        # 该岗位的验收必须对应应用时的运行时、任务设置与这份岗位快照，并通过与发布相同的门槛。
         covered=test.get('covered') or {}
         if (covered.get('runtime')!=runtime_signature() or covered.get('task')!=task_digest(bundle) or (covered.get('sources') or {}).get(cid)!=source_check_digest(item)
                 or test.get('signature')!=signature(test['bundle']) or incomplete_validation(test,test['bundle'],[cid])):
+            if action=='must_haves':raise ValueError('验收之后任务设置、岗位资料、执行代码或模型已变化，必须项的验收不再有效，请重新提交必须项')
             raise ValueError('验收之后任务设置、执行代码或模型已变化，新岗位的验收不再有效，请重新发起加入')
     prepared=manager.definitions.save({'expected_revision':task['revision'],'config':copy.deepcopy(cfg)},task_id,validate_only=True)
     version_id=uuid.uuid4().hex
     version={'id':version_id,'task_id':task_id,'bundle':bundle,'digest':digest(bundle),'created_at':now,'origin':'job_change',
              'validation':base.get('validation'),'test_id':base.get('test_id'),'base_version_id':base['id'],'job_change_id':record['id'],
-             **({'job_test_id':record['test_id']} if action=='add' else {})}
+             **({'job_test_id':record['test_id']} if action in ('add','must_haves') else {})}
     next_release={**release,'version_id':version_id,'revision':release['revision']+1,'released_at':now,'task_revision':prepared['revision'],'job_change_id':record['id']}
     items=[('agent_bundle',version_id,version,0,True),
            ('agent_release',task_id,next_release,db.revision('agent_release',task_id),True),
@@ -233,6 +251,8 @@ def apply(manager,record):
                 p.pop('decision_wait_until',None);p.pop('harness_decision',None);p.pop('conversation_semantics',None)
                 for msg in p.get('outbox',[]):
                     if msg['status'] in ('draft','approved'):msg.update(status='stale',approved_fingerprint=None)
+        elif c==cid and action=='must_haves':
+            case['job_sourcing']={**copy.deepcopy(case.get('job_sourcing') or item['sourcing']),'must_haves':copy.deepcopy(item['sourcing']['must_haves'])}
         overlay(case,prepared);case['agent_release_id']=version_id;case['updated_at']=now
         items.append(('case',c,case,db.revision('case',c),True))
     record={**record,'status':'applied','applied_at':now,'version_id':version_id}

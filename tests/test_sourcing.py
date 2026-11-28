@@ -139,3 +139,48 @@ def test_orphaned_send_claim_recovers_into_candidate_history(tmp_path):
  ledger.transition(ident,'executing')
  restored=CaseStore(tmp_path).load(case['id'])['candidates']['p']
  assert restored['outbox'][0]['status']=='delivery_unknown' and restored['outbox'][0]['operation_id']==ident
+
+
+def _ledger_state(store, op):
+    from cloakup.storage import operations, action_leases
+    from sqlalchemy import select
+    with store.db.engine.begin() as c:
+        state = c.execute(select(operations.c.state).where(operations.c.id == op)).scalar()
+        leased = c.execute(select(action_leases.c.operation_id).where(action_leases.c.operation_id == op)).first()
+    return state, leased
+
+
+def test_abort_restores_pre_claim_status(case_data):
+    # 11-27 10:28 赵清山：点发送前中止，消息一定没发出，不能记成回执未知、卡住候选人。
+    store, case = case_data
+    m = approved(store, case)
+    before = case['candidates']['person-1']['status']; revision = case['candidates']['person-1']['context_revision']
+    store.claim_send(case, 'person-1', m['id'])
+    op = m['operation_id'] if 'operation_id' in m else store._message(case['candidates']['person-1'], m['id'])['operation_id']
+    store.abort_send(case, 'person-1', m['id'], 'reply_during_typing')
+    person = case['candidates']['person-1']; message = store._message(person, m['id'])
+    assert message['status'] == 'stale' and message['abort_reason'] == 'reply_during_typing'
+    assert person['status'] == before and person['context_revision'] == revision + 1
+    assert _ledger_state(store, op) == ('failed', None)
+    assert any(a.get('kind') == 'send_aborted' for a in case.get('audit', []))
+
+
+def test_aborted_send_can_be_reclaimed(case_data):
+    store, case = case_data
+    m = approved(store, case)
+    store.claim_send(case, 'person-1', m['id'])
+    store.abort_send(case, 'person-1', m['id'], 'reply_during_typing')
+    again = approved(store, case)
+    store.claim_send(case, 'person-1', again['id'])
+    assert store._message(case['candidates']['person-1'], again['id'])['status'] == 'sending'
+
+
+def test_abort_after_status_changed_only_fails_ledger(case_data):
+    # 评审：发送前授权检查发现消息已不在发送中，中止时不能再抛错，账本也不能停在 executing。
+    store, case = case_data
+    m = approved(store, case)
+    store.claim_send(case, 'person-1', m['id'])
+    message = store._message(case['candidates']['person-1'], m['id']); op = message['operation_id']
+    message['status'] = 'stale'
+    store.abort_send(case, 'person-1', m['id'], 'not_authorized')
+    assert _ledger_state(store, op) == ('failed', None)

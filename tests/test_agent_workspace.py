@@ -243,6 +243,12 @@ def test_browser_adapter_changes_invalidate_release_signature(setup,monkeypatch,
     finally:monkeypatch.undo();runtime_files.cache_clear()
 
 
+def test_precontact_screening_files_are_in_release_signature():
+    # 11-27 首聊前初筛：初筛与每日额度决定首聊行为，改了它们已发布版本须重新验收。
+    from cloakup.agent_workspace import runtime_files
+    assert {'screening.py','job_quota.py'}<=set(runtime_files())
+
+
 async def test_model_validation_cannot_replace_executor_readiness(setup):
     from cloakup.workbench import Workbench
     lab,m,task,case=setup

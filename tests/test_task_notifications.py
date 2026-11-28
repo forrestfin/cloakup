@@ -262,3 +262,101 @@ async def test_resolved_recovery_todo_cancels_notification_before_send(env):
  state['status']='recovered';store.reconcile([run],[c]);await n.tick(m)
  assert not m._notification_client.calls
  assert all(row['status']=='cancelled' for row in m.db.list(n.KIND))
+
+
+# 11-27 10:43 系统暂停后，飞书待办与几十条问题、简历推送同一开头，没被注意到，停到 15:55。
+def _paused(m,*,actor='system',at=None,kind='execution_recovery'):
+ at=time.time()-60 if at is None else at
+ m.db.put('account_task','task1',{'id':'task1','status':'paused','case_ids':[],'history':[{'at':at,'status':'paused','actor':actor,'reason':'selection_blocked:draft_present'}]})
+ m.db.put('attention','todo1',{**m.db.get('attention','todo1'),'created_at':at,'kind':kind,'title':'会话选择恢复需要管理员处理','detail':'自动恢复未能安全完成，已暂停关联任务。','question':None,'task_id':'task1'})
+
+
+def _todo_sends(m):return [c for c in m._notification_client.calls if c[0]=='ou_admin']
+
+
+async def test_pause_todo_uses_paused_headline_and_workbench_url(env,monkeypatch):
+ m,task,c,p,record=env;_paused(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ text=_todo_sends(m)[0][3]['text']
+ assert text.splitlines()[0]=='【任务已暂停】高端岗位 · 寻访'
+ assert '暂停期间不收件、不回复候选人' in text and 'http://127.0.0.1:8766' in text
+
+
+async def test_question_todo_keeps_plain_headline(env):
+ m,task,c,p,record=env
+ for _ in range(3):await n.tick(m)
+ assert _todo_sends(m)[0][3]['text'].startswith('待办提醒')
+
+
+async def test_admin_pause_is_not_headlined_as_system_pause(env,monkeypatch):
+ m,task,c,p,record=env;_paused(m,actor='admin')
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ assert _todo_sends(m)[0][3]['text'].startswith('待办提醒')
+
+
+def _age_first(m,seconds):
+ for item in m.db.list(n.KIND):
+  if item['kind']=='todo':item['sent_at']=time.time()-seconds;m.db.put(n.KIND,item['id'],item)
+
+
+async def test_pause_reminder_after_30_minutes_inside_window(env,monkeypatch):
+ m,task,c,p,record=env;_paused(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ _age_first(m,29*60);await n.tick(m)
+ assert len(_todo_sends(m))==1
+ _age_first(m,40*60);await n.tick(m);await n.tick(m)
+ sends=_todo_sends(m);assert len(sends)==2 and sends[1][3]['text'].startswith('【任务已暂停】')
+ assert any(i.get('reminder')==1 for i in m.db.list(n.KIND))
+
+
+async def test_pause_reminder_skipped_outside_window(env,monkeypatch):
+ m,task,c,p,record=env;_paused(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:False)
+ _age_first(m,3*3600);await n.tick(m);await n.tick(m)
+ assert len(_todo_sends(m))==1
+
+
+async def test_pause_reminder_capped_at_three_per_day(env,monkeypatch):
+ m,task,c,p,record=env;_paused(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ for _ in range(4):
+  _age_first(m,3*3600);await n.tick(m);await n.tick(m)
+ assert len(_todo_sends(m))==3
+
+
+async def test_pause_reminder_cancelled_after_resume(env,monkeypatch):
+ m,task,c,p,record=env;_paused(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ _age_first(m,40*60);n.enqueue(m)
+ queued=[i for i in m.db.list(n.KIND) if i.get('reminder')==1];assert queued and queued[0]['status']=='queued'
+ m.db.put('account_task','task1',{'id':'task1','status':'running','case_ids':[],'history':[{'at':time.time(),'status':'running','actor':'admin'}]})
+ await n.tick(m);await n.tick(m)
+ assert len(_todo_sends(m))==1 and m.db.get(n.KIND,queued[0]['id'])['status']=='cancelled'
+
+
+async def test_cancelled_reminder_does_not_block_later_reminders(env,monkeypatch):
+ # 评审：提醒排队后任务恢复被取消，之后同一待办再次系统暂停，提醒仍要继续。
+ m,task,c,p,record=env;_paused(m)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ _age_first(m,40*60);n.enqueue(m)
+ m.db.put('account_task','task1',{'id':'task1','status':'running','case_ids':[],'history':[{'at':time.time(),'status':'running','actor':'admin'}]})
+ await n.tick(m);await n.tick(m)
+ _paused(m);await n.tick(m);await n.tick(m)
+ assert len(_todo_sends(m))==2
+
+
+async def test_old_todo_not_headlined_by_unrelated_later_pause(env,monkeypatch):
+ # 评审：服务重启等系统暂停不能把早就开着、与这次暂停无关的待办标成【任务已暂停】。
+ m,task,c,p,record=env;_paused(m,at=time.time()-60)
+ todo=m.db.get('attention','todo1');todo['created_at']=time.time()-6*3600;m.db.put('attention','todo1',todo)
+ monkeypatch.setattr(n,'_in_window',lambda task,now:True)
+ for _ in range(4):await n.tick(m)
+ assert _todo_sends(m)[0][3]['text'].startswith('待办提醒')

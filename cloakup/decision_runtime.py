@@ -206,12 +206,17 @@ def payload(case,person,plan,actions,answer,labels,feedback):
             'available_actions':actions,'optional_fact_indices':optional,'previous_results':feedback[-4:]}
     if set(actions)=={'contact','wait'}:
         # 首聊前的安全前提已由程序完成；未告知时模型会把“尚未联系”的正常状态误判为未核验而等待。
+        # 必须项初筛结论只给通过与否和待定条数；条目文字与证据不进模型。
+        from .job_sourcing import must_haves_revision
+        must=(case.get('job_sourcing') or {}).get('must_haves') or [];screening=person.get('screening') or {}
+        current=bool(must) and screening.get('revision')==must_haves_revision(must)
         content['first_contact_checks']={
+            'screening':{'passed':screening.get('outcome')=='pass' if current else None,'unclear_count':len(screening.get('unclear_ids') or []) if current else 0},
             'verified_by_program':['岗位首聊话术已与平台设置核对一致','候选人卡片显示可打招呼，本机无该候选人的会话或发送记录（去重已完成）',
                                    '推荐卡片与详情已只读核对','自动沟通授权、岗位暂停状态与发送额度已由程序校验'],
             'note':'conversation_bound=false、followup.state=no_verified_send 是尚未联系候选人的正常状态，不代表风险或未核验。'
                    '本轮只依据 professional_context 与 job.requirements 判断初步匹配度：首聊只是了解意向，不作录用决定，'
-                    '有限标签无法证明业绩属正常；有与 job.requirements 或本岗位职业关键词相关的经历线索时应联系，明显无关时再等待。'}
+                    '有限标签无法证明业绩属正常；程序已按本岗位必须项初筛通过（passed 为 null 表示本岗位未设必须项）；再对照 professional_context 与 job.requirements 复核，明显不相关时选择等待。'}
     return content
 
 

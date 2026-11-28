@@ -176,6 +176,58 @@ def _owns_todo(manager, task, todo):
     return run.get('params',{}).get('case_id') in cases
 
 
+# 11-27 10:43 系统暂停后，飞书待办与几十条问题、简历推送同一开头，没被注意到，停到 15:55。
+# 系统暂停类待办单独标题；一直没处理时首次推送后约 30 分钟再提醒，之后约每 2 小时，每个待办每天最多 3 次，只在任务执行时段内。
+REMIND_AFTER = (1800, 7200)
+REMIND_DAILY_MAX = 3
+
+
+def system_paused(manager, task_id):
+    """任务被系统（不是管理员）暂停时返回暂停时刻，否则 None。"""
+    member=next((m for m in manager.db.list('account_task') if m['id']==task_id),None)
+    if not member or member.get('status')!='paused':return None
+    last=(member.get('history') or [{}])[-1]
+    if last.get('actor')=='admin':return None
+    return last.get('at') or member.get('updated_at') or time.time()
+
+
+def pause_alert(manager, task_id, todo):
+    """该待办就是这次系统暂停的原因时返回暂停时刻：暂停类待办，且在暂停前 10 分钟内或之后生成。
+    服务重启等其他系统暂停不能把早就开着、与这次暂停无关的待办标成“任务已暂停”。"""
+    from .today import PAUSE_KINDS
+    if todo.get('kind') not in PAUSE_KINDS:return None
+    paused_at=system_paused(manager,task_id)
+    if not paused_at or (todo.get('created_at') or 0)<paused_at-600:return None
+    return paused_at
+
+
+def _schedule(task):
+    from .task_policy import DEFAULT_SCHEDULE
+    return task['config'].get('schedule') or DEFAULT_SCHEDULE
+
+
+def _in_window(task, now):
+    from .task_policy import window_status
+    return bool(window_status(_schedule(task),now)['allowed'])
+
+
+def _reminder_due(manager, task, todo, chain, now):
+    """chain：该待办已有的推送（首条 + 历次提醒），按序号排列。返回下一次是第几次提醒，或 None。"""
+    if not chain or not pause_alert(manager,task['id'],todo) or not _in_window(task,now):return None
+    live=[i for i in chain if i.get('status')!='cancelled']  # 任务恢复时取消的提醒不挡住之后的提醒
+    last=live[-1] if live else None
+    if not last or last.get('status')!='sent' or not last.get('sent_at'):return None
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    tz=ZoneInfo(_schedule(task).get('timezone','Asia/Shanghai'))
+    today=datetime.fromtimestamp(now,tz).date()
+    if sum(datetime.fromtimestamp(i.get('created_at',0),tz).date()==today for i in live)>=REMIND_DAILY_MAX:return None
+    n=len(live)  # 第 n 次提醒；间隔按实际推送过的条数算，被取消的不算
+    from .pacing import stable_fraction
+    gap=REMIND_AFTER[min(n-1,len(REMIND_AFTER)-1)]*(1+0.2*stable_fraction(todo['id'],len(chain)))
+    return n if now-last['sent_at']>=gap else None
+
+
 def enqueue(manager):
     db=manager.db; existing={i['id']:i for i in db.list(KIND)}
     files=db.list('resume_file'); todos=db.list('attention')
@@ -200,6 +252,16 @@ def enqueue(manager):
             for todo in todos:
                 if todo['status']!='resolved' and _owns_todo(manager,task,todo):
                     add(task,'todo',cfg['todo_user_id'],todo['id'],todo_id=todo['id'],case_id=todo.get('case_id'))
+                    if pause_alert(manager,task['id'],todo):
+                        chain=[existing.get(_key([task['id'],'todo',cfg['todo_user_id'],todo['id']]))]
+                        n=1
+                        while True:
+                            item=existing.get(_key([task['id'],'todo',cfg['todo_user_id'],todo['id']+':reminder:'+str(n)]))
+                            if not item:break
+                            chain.append(item);n+=1
+                        chain=[i for i in chain if i]
+                        due=_reminder_due(manager,task,todo,chain,time.time())
+                        if due:add(task,'todo',cfg['todo_user_id'],todo['id']+':reminder:'+str(len(chain)),todo_id=todo['id'],case_id=todo.get('case_id'),reminder=due)
 
 
 def _current(manager,item):
@@ -214,6 +276,7 @@ def _current(manager,item):
         try: todo=manager.db.get('attention',item['todo_id'])
         except FileNotFoundError: return None
         if todo['status']=='resolved' or not _owns_todo(manager,task,todo): return None
+        if item.get('reminder') and not pause_alert(manager,task['id'],todo): return None
     return task
 
 
@@ -245,14 +308,24 @@ def _process(manager,client,item):
             receiver_type='chat_id'
         else:
             todo=db.get('attention',item['todo_id'])
-            body='待办提醒\n任务：'+task['config']['name']+'\n'+todo['title']
-            if todo.get('job_label'): body+='\n岗位：'+todo['job_label']
-            if todo.get('question'): body+='\n候选人问题：'+todo['question'][:600]
-            if todo.get('kind')=='execution_recovery':
-                body+='\n恢复尝试：'+str(todo.get('recovery_attempts',0))+'/'+str(todo.get('recovery_max_attempts',3))
-                body+='\n'+todo['detail']
-            body+='\n请在 cloakup 平台待办中心处理。\n待办编号：'+todo['id']
-            parts=[('message','text',{'text':body})];receiver_type='open_id'
+            paused_at=pause_alert(manager,task['id'],todo)
+            if paused_at:
+                from zoneinfo import ZoneInfo
+                from datetime import datetime
+                clock=datetime.fromtimestamp(paused_at,ZoneInfo(_schedule(task).get('timezone','Asia/Shanghai'))).strftime('%m-%d %H:%M')
+                body=('【任务已暂停】'+task['config']['name']+'\n暂停时间：'+clock+('（第 '+str(item['reminder'])+' 次提醒，仍未处理）' if item.get('reminder') else '')
+                      +'\n影响：暂停期间不收件、不回复候选人\n原因：'+todo['title']+'\n'+(todo.get('detail') or '')
+                      +'\n处理：打开工作台 http://127.0.0.1:'+os.environ.get('CLOAKUP_PUBLIC_PORT','8766')+' → 管理员待办\n待办编号：'+todo['id'])
+                parts=[('message','text',{'text':body})];receiver_type='open_id'
+            else:
+                body='待办提醒\n任务：'+task['config']['name']+'\n'+todo['title']
+                if todo.get('job_label'): body+='\n岗位：'+todo['job_label']
+                if todo.get('question'): body+='\n候选人问题：'+todo['question'][:600]
+                if todo.get('kind')=='execution_recovery':
+                    body+='\n恢复尝试：'+str(todo.get('recovery_attempts',0))+'/'+str(todo.get('recovery_max_attempts',3))
+                    body+='\n'+todo['detail']
+                body+='\n请在 cloakup 平台待办中心处理。\n待办编号：'+todo['id']
+                parts=[('message','text',{'text':body})];receiver_type='open_id'
         for part,msg_type,content in parts:
             if item.get(part+'_message_id'): continue
             if not _current(manager,item):
